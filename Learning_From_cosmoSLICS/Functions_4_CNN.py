@@ -134,45 +134,59 @@ def Untransform_Data(data, mean, std):
         new_data[:,i,:,:] = std[i]*data[:,i,:,:] + mean[i]
     return new_data
 
+
+def Avg_Pred(pred,test):
     
-def Plot_Accuracy(pred,test):
-    # first avg & std the predictions for each test cosmology
+    # This read in the test set predictions for every single realisation and cosmology,
+    # and converts these to an avg & mean-err per cosmology.
+    # reads in the (true) test cosmologies so it can figure out which predictions it needs to avg together.
+
     # Find the unique values of Omega_m, to figure out how many test cosmologies there are
     indices = np.unique( test[:,0], return_index=True )[1]
     test_unique = test[ np.sort(indices), : ] # the unique test cosmologies
-    
-    pred_avg = np.zeros_like( test_unique ) 
-    pred_std = np.zeros_like( test_unique )
+
+    pred_avg = np.zeros_like( test_unique )
+    pred_err = np.zeros_like( test_unique )             # this will be error on mean (std/sqrt(N))
+    count_per_cosmo = np.zeros( test_unique.shape[0] )  # counts the no. of realisations per cosmo
 
     for i in range( test_unique.shape[0] ):     # scroll through the unique cosmologies
         # Get the indices of rows that match the 1st unique cosmology
         # these are the predictions we need to avg and take the std of.
         idx = np.where( test[:,0] == test_unique[i,0] )[0]
+        count_per_cosmo[i] = float( len(idx) )
         for j in range( test.shape[1] ):       # scroll through (Omega_m, S_8, h, w0)
             pred_avg[i,j] = np.mean( pred[idx,j] )
-            pred_std[i,j] = np.std( pred[idx,j] )
+            pred_err[i,j] = np.std( pred[idx,j] ) / np.sqrt(count_per_cosmo[i])
+            
+    return pred_avg, pred_err, test_unique
 
-    # Now plot the accuracies of the predictions
-    fig = plt.figure(figsize = (8,8))
-    if pred.shape[1] % 2 ==0:
+
+def Plot_Accuracy(pred_avg, pred_err, test_unique, xtick_labels, savename):
+    # plot the avg accuracies of the predictions and their errors
+    fig = plt.figure(figsize = (12,9))
+    if pred_avg.shape[1] % 2 ==0:
         # an even number of panels to produce
-        nrows = int(pred.shape[1]/2)
+        nrows = int(pred_avg.shape[1]/2)
     else:
         # odd number of panels, round up number of rows
-        nrows = int(pred.shape[1]/2) + 1
-        
+        nrows = int(pred_avg.shape[1]/2) + 1
+
     gs1 = gridspec.GridSpec(2, nrows )
     colors = [ 'magenta', 'darkblue', 'dimgrey', 'orange']
     plot_labels = [ r'$\Omega_{\rm m}$', r'$S_8$', r'$h$', r'$w_0$' ]
-    for j in range( test.shape[1] ):           # scroll through (Omega_m, S_8, h, w0) 
+    for j in range( test_unique.shape[1] ):           # scroll through (Omega_m, S_8, h, w0) 
         ax = plt.subplot(gs1[j], adjustable='box')
         ax.errorbar( np.arange( test_unique.shape[0] )+1,
                      100.*(pred_avg[:,j]/test_unique[:,j] -1.),
-                     yerr=100.*( pred_std[:,j]/test_unique[:,j] /np.sqrt( len(test_unique[:,j]) ) ),
+                     yerr=100.*( pred_err[:,j]/test_unique[:,j] ),
                      color=colors[j], fmt='o')
         ax.set_ylabel(r'%s Accuracy' %plot_labels[j] + r' [\%]')
+        ax.set_xlabel(r'cosmoSLICS ID')
+        plt.sca(ax)
+        plt.xticks(np.arange( test_unique.shape[0] )+1, xtick_labels)
     plt.subplots_adjust(hspace=0)
-    plt.show()
-    return
+    plt.savefig( savename )
+    #plt.show()
+    return 
 
 
