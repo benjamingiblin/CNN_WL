@@ -29,12 +29,18 @@ import time                                       # Used to time parts of the co
 import sys                                        # Used to exit code without error, and read in inputs from command line    
 import os
 import random
-from Functions_4_CNN import Slow_Read, Transform_Data, Untransform_Data, Avg_Pred, Plot_Accuracy
+from Functions_4_CNN import Slow_Read, Transform_Data, Untransform_Data, Avg_Pred, Plot_Accuracy, Plot_Accuracy_vs_nlayers
+
+import torch          # main neural net module
+import torch.nn as nn
+import torch.nn.functional as F
+# find GPU device if available, else use CPU
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 Train_CNN = True              # If True it will train the CNN (obviously)
                               # If False it will read a pre-saved CNN
 
-mock_Type = 'KV450'
+mock_Type = "KV450"
 Data_Type = "Shear"           # Ultimately may use kappa maps as well
                               # in which case this variable will change.
                               # !!! Note, still need to code in this functionality !!!
@@ -42,15 +48,15 @@ Data_Type = "Shear"           # Ultimately may use kappa maps as well
 ZBlabel = ['ZBcut0.1-0.3', 'ZBcut0.3-0.5', 'ZBcut0.5-0.7', 'ZBcut0.7-0.9', 'ZBcut0.9-1.2']
           #['ZBcut0.1-1.2']   # The redshift range imposed on the maps
           
-Augment = "None"              # If not "None", will augment the training&test data sets by
-                              # reading in rotated/reflected versions of the maps.
+Augment = True                # If True, will augment the training&test data sets by
+                              # reading in rotated & reflected versions of the maps.
                               # !!! Note, still need to code in this functionality !!!
           
-Noise = 'None'                # The shape noise level in the maps
+Noise = "None"                # The shape noise level in the maps
 Res = 128                     # The number of pxls on each side of the maps
 nclayers = int(sys.argv[1])                  # The number of conv. layers to have in the CNN
                               # The number of fully connected (FC) layers is currently fixed to 1.
-
+print("Setting a CNN with %s conv layers." %nclayers)
                               
 RUN = 0                       # Variable for checking convergence of CNN predictions
                               # run the CNN several times changing only this variable
@@ -92,62 +98,59 @@ Realisations = 25
 num_pCosmol = 4 # The number of cosmol. params to read in and predict with the CNN
 Cosmols_Raw = np.loadtxt(CS_DIR+'/cosmoSLICS_Cosmologies_Omm-S8-h-w0-sig8-sig8bf.dat')[:,0:num_pCosmol] # Only take the frst n columns
 
-Read_DIR = 'QuickReadData/SplitType-%s' %Split_Type
+# Establish the in/output subdirectory anme, where the trained CNN & data will be saved (or loaded from).
+# Make the output directory different for each mock suite, data tpye (shear/kappa),
+# split done on the data, if the data set was augmented, num. zbins, noiseless/noisy maps, num pxls on each map size (Res),
+Data_keyname = 'Mock%s_Data%s_Split%s_zBins%s_Noise%s_Aug%s_Res%s' %(mock_Type,Data_Type,Split_Type,
+                                                                     len(ZBlabel),Noise,
+                                                                     Augment,Res)
+Read_DIR = 'QuickReadData/%s' %Data_keyname
 if Fast_Or_Slow_Read == "Slow":
     print("Performing a slow read of the input data!")
     # Slow read of data takes ~140s PER z-bin on cuillin head node
-    Shear, Train_Shear, Test_Shear, Cosmols, Train_Cosmols, Test_Cosmols, Train_Cosmols_IDs, Test_Cosmols_IDs = Slow_Read(CS_DIR,
-                                                                                                                          mock_Type,
-                                                                                                                          Cosmols_Raw,
-                                                                                                                          mockIDs,
-                                                                                                                          Train_mockIDs,
-                                                                                                                          Test_mockIDs,
-                                                                                                                          Realisations,
-                                                                                                                          ZBlabel,
-                                                                                                                          Res,
-                                                                                                                          Test_Realisation_num,
-                                                                                                                          Noise)
+    Shear,Train_Shear,Test_Shear, Cosmols,Train_Cosmols,Test_Cosmols, Cosmols_IDs,Train_Cosmols_IDs,Test_Cosmols_IDs = Slow_Read(CS_DIR,       mock_Type,Cosmols_Raw,mockIDs,Train_mockIDs,Test_mockIDs,Realisations,ZBlabel,Res,Test_Realisation_num,Noise,Augment)
                                                                                                                           
     # Pickle the train/test data to make reading faster next time
     if not os.path.exists(Read_DIR):
         os.makedirs(Read_DIR)
     # Save shear
-    np.save('QuickReadData/Shear_numz%s_SN%s_Res%s' %(len(ZBlabel), Noise, Res), Shear )
-    np.save('%s/Train_Shear_numz%s_SN%s_Res%s' %(Read_DIR, len(ZBlabel), Noise, Res), Train_Shear )
-    np.save('%s/Test_Shear_numz%s_SN%s_Res%s' %(Read_DIR, len(ZBlabel), Noise, Res), Test_Shear )
+    np.save('%s/Shear' %Read_DIR, Shear )
+    np.save('%s/Train_Shear' %Read_DIR, Train_Shear )
+    np.save('%s/Test_Shear'  %Read_DIR, Test_Shear )
     # Save cosmols
-    np.save('QuickReadData/Cosmol_numz%s_numPCosmol%s' %(len(ZBlabel), num_pCosmol), Cosmols )
-    np.save('%s/Train_Cosmol_numz%s_numPCosmol%s' %(Read_DIR, len(ZBlabel), num_pCosmol), Train_Cosmols )
-    np.save('%s/Test_Cosmol_numz%s_numPCosmol%s' %(Read_DIR, len(ZBlabel), num_pCosmol), Test_Cosmols )
+    np.save('%s/Cosmol_numPCosmol%s' %(Read_DIR, num_pCosmol), Cosmols )
+    np.save('%s/Train_Cosmol_numPCosmol%s' %(Read_DIR,num_pCosmol), Train_Cosmols )
+    np.save('%s/Test_Cosmol_numPCosmol%s' %(Read_DIR, num_pCosmol), Test_Cosmols )
     # Save cosmol IDs
-    np.savetxt('%s/Train_Cosmol_numz%s.txt' %(Read_DIR, len(ZBlabel)),
-               Train_Cosmols_IDs, header='Cosmol ID for map in Train set', fmt='%s')
-    np.savetxt('%s/Test_Cosmol_numz%s.txt' %(Read_DIR, len(ZBlabel)),
-               Test_Cosmols_IDs, header='Cosmol ID for map in Test set', fmt='%s')
+    np.savetxt('%s/Cosmol_IDs.txt' %Read_DIR,
+               Cosmols_IDs, header='Cosmol ID for map in Shear set', fmt='%s')
+    np.savetxt('%s/Train_Cosmol_IDs.txt' %Read_DIR,
+               Train_Cosmols_IDs, header='Cosmol ID for map Train_Shear set', fmt='%s')
+    np.savetxt('%s/Test_Cosmol_IDs.txt' %Read_DIR,
+               Test_Cosmols_IDs, header='Cosmol ID for map in Test_Shear set', fmt='%s')
     
     
 elif Fast_Or_Slow_Read == "Fast":
-    # Takes only ~47s for 5 z-bins
+    # For shear only, takes 47s for 5 bins & Augment=False,
+    # 337s for 5 zbins & Agument=True,
     print("Performing a quick read of the input data.")
     t1 = time.time()
     # Read pickled shear
-    Shear = np.load('QuickReadData/Shear_numz%s_SN%s_Res%s.npy' %(len(ZBlabel), Noise, Res))
-    Train_Shear = np.load('%s/Train_Shear_numz%s_SN%s_Res%s.npy' %(Read_DIR, len(ZBlabel), Noise, Res))
-    Test_Shear = np.load('%s/Test_Shear_numz%s_SN%s_Res%s.npy' %(Read_DIR, len(ZBlabel), Noise, Res))
+    Shear = np.load('%s/Shear.npy' %Read_DIR)
+    Train_Shear = np.load('%s/Train_Shear.npy' %Read_DIR)
+    Test_Shear = np.load('%s/Test_Shear.npy'  %Read_DIR)
     # Read pickled Cosmols
-    Cosmols = np.load('QuickReadData/Cosmol_numz%s_numPCosmol%s.npy' %(len(ZBlabel), num_pCosmol))
-    Train_Cosmols = np.load('%s/Train_Cosmol_numz%s_numPCosmol%s.npy' %(Read_DIR, len(ZBlabel), num_pCosmol))
-    Test_Cosmols = np.load('%s/Test_Cosmol_numz%s_numPCosmol%s.npy' %(Read_DIR, len(ZBlabel), num_pCosmol))
-    # Read pickled Cosmol ID arrays
-    Train_Cosmols_IDs = np.genfromtxt('%s/Train_Cosmol_numz%s.txt' %(Read_DIR, len(ZBlabel)), dtype='str' )
-    Test_Cosmols_IDs =	np.genfromtxt('%s/Test_Cosmol_numz%s.txt' %(Read_DIR, len(ZBlabel)), dtype='str' )
+    Cosmols = np.load('%s/Cosmol_numPCosmol%s.npy' %(Read_DIR, num_pCosmol))
+    Train_Cosmols = np.load('%s/Train_Cosmol_numPCosmol%s.npy' %(Read_DIR,num_pCosmol))
+    Test_Cosmols = np.load('%s/Test_Cosmol_numPCosmol%s.npy' %(Read_DIR, num_pCosmol))
+    # Read Cosmol ID arrays
+    Cosmols_IDs = np.genfromtxt('%s/Cosmol_IDs.txt' %Read_DIR, dtype='str')
+    Train_Cosmols_IDs = np.genfromtxt('%s/Train_Cosmol_IDs.txt' %Read_DIR, dtype='str' )
+    Test_Cosmols_IDs =	np.genfromtxt('%s/Test_Cosmol_IDs.txt' %Read_DIR, dtype='str' )
     t2 = time.time()
     print("Quick read of data took %.0f s for %s redshift bins." %((t2-t1),len(ZBlabel)) )
 
-                           
-import torch          # main neural net module
-import torch.nn as nn
-import torch.nn.functional as F
+
 #import torchvision    # This is a handy module used to load data of various forms
 #import torchvision.transforms as transforms
 
@@ -227,20 +230,15 @@ class Net(nn.Module):
         x = self.fc1(x)
         return x
 net = Net()
-net = net.float()
-#output = net(Train_Shear[0:5,:].float())
+net.to(device).float()
+#output = net(Train_Shear[0:5,:].to(device).float())
 #print("Input shape is ", Train_Shear.shape)
 #print("Output shape is ", output.shape)
 
-
-# Establish the output directory, where the trained CNN will be saved (or loaded from).
-# Make the output directory different for each mock suite, data tpye (shear/kappa),
-# split done on the data, if the data set was augmented, num. zbins, noiseless/noisy maps, num pxls on each map size (Res),
-# and the number of conv & FC layers.
-Out_DIR = 'Results_CNN/Mock%s_Data%s_Split%s_zBins%s_Noise%s_Aug%s_Res%s/Net_convlayers%s_FClayers1' %(mock_Type,Data_Type,Split_Type,
-                                                                                                       len(ZBlabel),Noise,
-                                                                                                       Augment,Res,
-                                                                                                       nclayers)
+# Set the up the save directory for the results -
+# depends on all parameters of the data (Data_keyname)
+# and the number of layers in the CNN:
+Out_DIR = 'Results_CNN/%s/Net_convlayers%s_FClayers1' %(Data_keyname,nclayers)
 if not os.path.exists(Out_DIR):
     os.makedirs(Out_DIR)
 
@@ -275,8 +273,8 @@ if Train_CNN:
         rand_idx = np.reshape( rand_idx, ( int(len(rand_idx)/batch_size), batch_size) )
 
         for i in range( rand_idx.shape[0] ):
-            inputs = Train_Shear[ rand_idx[i] ]
-            labels = Train_Cosmols[ rand_idx[i] ]
+            inputs = Train_Shear[ rand_idx[i] ].to(device)
+            labels = Train_Cosmols[ rand_idx[i] ].to(device)
 
             # zero the parameter gradients
             optimizer.zero_grad()
@@ -293,7 +291,7 @@ if Train_CNN:
                 print('[%d, %5d] loss: %.3f' %
                       (epoch + 1, i + 1, running_loss/10 ))
                 #print( labels )
-                print( outputs )
+                #print( outputs )
                 running_loss = 0.0
 
     t2 = time.time()
@@ -304,6 +302,7 @@ if Train_CNN:
 else:
     # Don't train, load a pre-trained CNN
     net = Net()
+    net.to(device).float()
     net.load_state_dict(torch.load('%s/Net_%s.pth' %(Out_DIR,Arch_keyname)))
 
 
@@ -318,11 +317,11 @@ rand_idx_test = np.reshape( rand_idx_test, ( int(len(rand_idx_test)/batch_size),
 # This is an array to store the outputs of the CNN
 Test_Cosmols_Pred = np.zeros([ Test_Shear.shape[0], Test_Cosmols.shape[1] ])
 for i in range( rand_idx_test.shape[0] ):
-    inputs = Test_Shear[ rand_idx_test[i] ]
-    labels = Test_Cosmols[ rand_idx_test[i] ]
+    inputs = Test_Shear[ rand_idx_test[i] ].to(device)
+    labels = Test_Cosmols[ rand_idx_test[i] ].to(device)
     outputs = net(inputs.float())
     # Store the output predictions
-    Test_Cosmols_Pred[i*batch_size:(i+1)*batch_size, :] = outputs.detach().numpy()
+    Test_Cosmols_Pred[i*batch_size:(i+1)*batch_size, :] = outputs.detach().cpu().numpy()
 
 # The CNN has produced many predictions at each cosmology.
 # Compute an avg prediction per cosmology and corresponding error.
@@ -335,6 +334,28 @@ np.save('%s/TestTrue'%Out_DIR, Test_Cosmols_Unique )
 
 # Plot the accuracy results
 savename = '%s/PlotAcc_%s.png' %(Out_DIR, Arch_keyname)
-Plot_Accuracy( Test_Cosmols_Pred_Avg, Test_Cosmols_Pred_Err,
-               Test_Cosmols_Unique,
-               Test_mockIDs, savename)
+#Plot_Accuracy( Test_Cosmols_Pred_Avg, Test_Cosmols_Pred_Err,
+#               Test_Cosmols_Unique,
+#               Test_mockIDs, savename)
+
+
+Run_Multilayers = False
+if Run_Multilayers:
+    # Read in the results for multiple CNN architectures,
+    # i.e. changing in number of conv layers, and plot how the accuracy changes nclayers:
+    multi_layers = np.arange(1,11)
+    Test_Cosmols_Pred_Avg_Stack = np.zeros([ Test_Cosmols_Pred_Avg.shape[0],
+                                         Test_Cosmols_Pred_Avg.shape[1], len(multi_layers) ])
+    Test_Cosmols_Pred_Err_Stack = np.zeros_like( Test_Cosmols_Pred_Avg_Stack )
+    for i in range( len(multi_layers) ):
+        tmp_Out_DIR = Out_DIR.split('convlayers')[0] + 'convlayers%s_FC'%multi_layers[i] + Out_DIR.split('FC')[-1]
+        Test_Cosmols_Pred_Avg_Stack[:,:,i] = np.load('%s/TestPredAvg_%s.npy' %(tmp_Out_DIR,Arch_keyname))
+        Test_Cosmols_Pred_Err_Stack[:,:,i] = np.load('%s/TestPredErr_%s.npy' %(tmp_Out_DIR,Arch_keyname))
+
+    multi_savename = '%s/Plot-Nclayers%s-%s_%s.png' %(tmp_Out_DIR, multi_layers[0], multi_layers[1], Arch_keyname)
+    Plot_Accuracy_vs_nlayers(multi_layers,
+                             Test_Cosmols_Pred_Avg_Stack,
+                             Test_Cosmols_Pred_Err_Stack,
+                             Test_Cosmols_Unique,
+                             Test_mockIDs,
+                             multi_savename)
