@@ -26,10 +26,13 @@
 import numpy as np                                # Useful for managing/reading data
 from astropy.io import fits                       # For reading FITS files
 import time                                       # Used to time parts of the code.
-import sys                                        # Used to exit code without error, and read in inputs from command line    
+import sys                                        # Used to exit code w/o error & read in inputs from command line    
 import os
 import random
-from Functions_4_CNN import Slow_Read, Transform_Data, Untransform_Data, Avg_Pred, Plot_Accuracy, Plot_Accuracy_vs_nlayers
+from scipy.ndimage import gaussian_filter as gauss
+from Classes_4_CNN import Linear_Net
+from Functions_4_CNN import Slow_Read, Transform_Data, Untransform_Data, Calc_Output_Map_Size, Train_CNN, Test_CNN
+from Functions_4_CNN import Avg_Pred, Plot_Accuracy, Plot_Accuracy_vs_Q, Plot_Pred_vs_Q
 
 import torch          # main neural net module
 import torch.nn as nn
@@ -39,26 +42,61 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 Train_CNN = True              # If True it will train the CNN (obviously)
                               # If False it will read a pre-saved CNN
+Test_CNN = True               # If True, runs the CNN on the test cosmologies
+                              # Otherwise it reads in the pre-saved results
 
-mock_Type = "KV450"
+Net_Type = "Linear" # If Linear, then conv layers are applied sequentially (no residual layers).
+
+mock_Type = "KV450" #"KV450" #"KiDS1000"
+if mock_Type == "KV450":
+    Realisations = 25
+elif mock_Type== "KiDS1000":
+    Realisations = 10
+
 Data_Type = "Shear"           # Ultimately may use kappa maps as well
                               # in which case this variable will change.
                               # !!! Note, still need to code in this functionality !!!
                             
 ZBlabel = ['ZBcut0.1-0.3', 'ZBcut0.3-0.5', 'ZBcut0.5-0.7', 'ZBcut0.7-0.9', 'ZBcut0.9-1.2']
           #['ZBcut0.1-1.2']   # The redshift range imposed on the maps
+neff =    [0.62, 1.18, 1.85, 1.26, 1.31]        # The num of gals per arcmin^2 in each redshift bin
+sigma_e = [ 0.27, 0.258, 0.273, 0.254, 0.27 ]   # galaxy dispersion in each redshift bin
+          # We need these two arrays to generate shape noise realisations if Noise_Cycle is True.
           
-Augment = True                # If True, will augment the training&test data sets by
-                              # reading in rotated & reflected versions of the maps.
-                              # !!! Note, still need to code in this functionality !!!
+Augment_Train = True          # If True, within the training loop, it will perform rotations/reflections
+                              # of each map, to help the CNN learn cosmol. is invariant to these.
+Augment_Data = False          # Leave False. If True, it reads rot'd/ref'd maps into memory.
+                              # This is redundant if Augment_Train is True, and former takes less memory.
           
-Noise = "None"                # The shape noise level in the maps
+Noise_Data = "None"           # The shape noise level in the maps you read in: "None"/"On"
+Noise_Cycle = False            # If True, it will make multiple shape noise realistions
+                              # of each shear-only map, and cycle through these in training.
+N_Noise = 20                  # The number of shape noise realisations to do if Noise_Cycle is True.
+if Noise_Cycle==True:
+    # Create a Noise_SaveTag string to designate how many noise realisations were used in Training
+    Noise_SaveTag = "Cycle%s" %N_Noise
+    
+    if Noise_Data=="On":
+        print("You cannot have Noise_Data 'On' and Noise_Cycle 'True'. One or the other but not both. EXITING.")
+        sys.exit()
+else:
+    N_Noise = 1
+    Noise_SaveTag = Noise_Data # either "On" (fixed finite shape noise) or "None"
+
+# If we include shape noise, need smaller learning rate(?)
+if Noise_SaveTag == "None":
+    lr=5e-6
+else:
+    lr="Not sure..."          # tried doen to 1e-8, get problems with fixed shape noise.        
+
 Res = 128                     # The number of pxls on each side of the maps
-nclayers = int(sys.argv[1])                  # The number of conv. layers to have in the CNN
+nclayers = int(sys.argv[1])   # The number of conv. layers to have in the CNN
                               # The number of fully connected (FC) layers is currently fixed to 1.
-print("Setting a CNN with %s conv layers." %nclayers)
+conv1_filter = int(sys.argv[2]) 
                               
-RUN = 0                       # Variable for checking convergence of CNN predictions
+print("Setting up a CNN with %s conv layers." %nclayers)
+                              
+Epochs_Tot = int(sys.argv[3]) # Variable for checking convergence of CNN predictions
                               # run the CNN several times changing only this variable
                               # and compare output to verify convergence.
 
@@ -73,11 +111,16 @@ Split_Type = "Fid"            # "Fid" meaning fiducial, means the 6 cosmols clos
                            
 if Split_Type == "Fid":
     Test_mockIDs = ['00','05','07','12','18','fid']     # the test mock IDs
-    Test_Realisation_num = 12 # Use this many of the lines of sight in Test set
-                              # So the other (Realisations-Test_Realisation_num) will be in the training set  
+    Test_Realisation_num = int(Realisations/2)  # Use this many of the lines of sight in Test set
+                              # So the other (Realisations-Test_Realisation_num) will be in the training set
+                              
+elif Split_Type == "None":
+    # Then there is no splitting of the train & test sets, everything is put in the training set.
+    Test_mockIDs = []
+    Test_Realisation_num = 0
 
 else:
-    print("The only Split_Type currently supported is Fid. Please set accordingly. EXITING.")
+    print("The only Split_Type's currently supported are: Fid, None. Please set accordingly. EXITING.")
     sys.exit()
 
                               
@@ -89,9 +132,11 @@ for i in range(25):
     if '%.2d'%i not in Test_mockIDs: 
         Train_mockIDs.append('%.2d' %i)
 mockIDs.append('fid')
+if 'fid' not in Test_mockIDs:
+    Train_mockIDs.append('fid')
 
 CS_DIR = '/home/bengib/cosmoSLICS/'          # cosmoSLICS directory
-Realisations = 25
+
 
 # Read in the cosmological parameters                                                                                         
 # These will be the output of the neural net
@@ -102,13 +147,13 @@ Cosmols_Raw = np.loadtxt(CS_DIR+'/cosmoSLICS_Cosmologies_Omm-S8-h-w0-sig8-sig8bf
 # Make the output directory different for each mock suite, data tpye (shear/kappa),
 # split done on the data, if the data set was augmented, num. zbins, noiseless/noisy maps, num pxls on each map size (Res),
 Data_keyname = 'Mock%s_Data%s_Split%s_zBins%s_Noise%s_Aug%s_Res%s' %(mock_Type,Data_Type,Split_Type,
-                                                                     len(ZBlabel),Noise,
-                                                                     Augment,Res)
+                                                                     len(ZBlabel),Noise_Data,
+                                                                     Augment_Data,Res)
 Read_DIR = 'QuickReadData/%s' %Data_keyname
 if Fast_Or_Slow_Read == "Slow":
     print("Performing a slow read of the input data!")
     # Slow read of data takes ~140s PER z-bin on cuillin head node
-    Shear,Train_Shear,Test_Shear, Cosmols,Train_Cosmols,Test_Cosmols, Cosmols_IDs,Train_Cosmols_IDs,Test_Cosmols_IDs = Slow_Read(CS_DIR,       mock_Type,Cosmols_Raw,mockIDs,Train_mockIDs,Test_mockIDs,Realisations,ZBlabel,Res,Test_Realisation_num,Noise,Augment)
+    Shear,Train_Shear,Test_Shear, Cosmols,Train_Cosmols,Test_Cosmols, Cosmols_IDs,Train_Cosmols_IDs,Test_Cosmols_IDs = Slow_Read(CS_DIR, mock_Type,Cosmols_Raw,mockIDs,Train_mockIDs,Test_mockIDs,Realisations,ZBlabel,Res,Test_Realisation_num,Noise,False)
                                                                                                                           
     # Pickle the train/test data to make reading faster next time
     if not os.path.exists(Read_DIR):
@@ -129,10 +174,9 @@ if Fast_Or_Slow_Read == "Slow":
     np.savetxt('%s/Test_Cosmol_IDs.txt' %Read_DIR,
                Test_Cosmols_IDs, header='Cosmol ID for map in Test_Shear set', fmt='%s')
     
-    
 elif Fast_Or_Slow_Read == "Fast":
-    # For shear only, takes 47s for 5 bins & Augment=False,
-    # 337s for 5 zbins & Agument=True,
+    # For shear only, takes 47s for 5 bins & Augment_Data=False,
+    # 337s for 5 zbins & Agument_Data=True,
     print("Performing a quick read of the input data.")
     t1 = time.time()
     # Read pickled shear
@@ -150,142 +194,160 @@ elif Fast_Or_Slow_Read == "Fast":
     t2 = time.time()
     print("Quick read of data took %.0f s for %s redshift bins." %((t2-t1),len(ZBlabel)) )
 
+    
+if Fast_Or_Slow_Read != "None":
+    # Then it means the data was read in, proceed to transform it:
+    # Apply Gaussian smoothing of maps
+    sigma_pxl=1 # smoothing scale in units of pxl
+    Shear = gauss(Shear, sigma=[0,0,sigma_pxl,sigma_pxl])
+    Train_Shear = gauss(Train_Shear, sigma=[0,0,sigma_pxl,sigma_pxl])
+    Test_Shear = gauss(Test_Shear, sigma=[0,0,sigma_pxl,sigma_pxl])
 
-#import torchvision    # This is a handy module used to load data of various forms
-#import torchvision.transforms as transforms
+    input_channel = Train_Shear.shape[1]
+    # A mean and stan-dev for each channel - used to normalise data
+    Mean_T = np.zeros(input_channel)
+    Std_T = np.zeros(input_channel)
+    for i in range(input_channel):
+        Mean_T[i] = np.mean( Train_Shear[:,i,:,:] )
+        Std_T[i] = np.std( Train_Shear[:,i,:,:] )
 
-# Apply Transforms to data
-# Define the transform that will be applied to the input data
-#transform = transforms.Compose(
-#    [transforms.ToTensor(),
-#     transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))])
+    # Convert inputs to torch tensors
+    Train_Cosmols = torch.from_numpy( Train_Cosmols ) 
+    Test_Cosmols = torch.from_numpy( Test_Cosmols )
 
-
-# A mean and stan-dev for each channel - used to normalise data
-Mean_T = np.zeros(Train_Shear.shape[1])
-Std_T = np.zeros(Train_Shear.shape[1])
-for i in range(Train_Shear.shape[1]):
-    Mean_T[i] = np.mean( Train_Shear[:,i,:,:] )
-    Std_T[i] = np.std( Train_Shear[:,i,:,:] )
-
-# Convert inputs to torch tensors
-Train_Cosmols = torch.from_numpy( Train_Cosmols ) 
-Test_Cosmols = torch.from_numpy( Test_Cosmols )
-
-Train_Shear = torch.from_numpy( Transform_Data(Train_Shear, Mean_T, Std_T) ).double()
-Test_Shear = torch.from_numpy( Transform_Data(Test_Shear, Mean_T, Std_T) ).double()
-
+    Train_Shear = torch.from_numpy( Transform_Data(Train_Shear, Mean_T, Std_T) ).double()
+    Test_Shear = torch.from_numpy( Transform_Data(Test_Shear, Mean_T, Std_T) ).double()
+    
+    # Save the mean & stdev so the KiDS-1000 data can be transformed in the same way:
+    np.savetxt('%s/Channel_Mean_Stdev.txt' %Read_DIR, np.c_[Mean_T, Std_T], header='# channel mean, sigma')
+    
+else:
+    input_channel = 10  # dummy number, defined only so the NN can be defined below,
+                        # although we're not running the CNN if Fast_Or_Slow_Read is "None"
+                        # (no data read in).
 
 # Define the padding, stride & filter sizes to be used in the CNN layers
-# and define a function to compute the activation map size from these.
-
-def Calc_Output_Map_Size(initial_size, F, P, S):
-    output_size = float(initial_size - F + 2*P) / S
-    if output_size == int(output_size):
-        # if integer, add one
-        output_size += 1
-    else:
-        # if non-integer, need to add 0.5
-        output_size += 0.5
-    return int(output_size)
-
-conv1_padding=0 # padding applied on 1st conv layer
-conv1_filter =5 # filter size of first conv layer (also subsequent layers)
-conv1_stride=1  # stride used in first conv layer (also subsequent layers)  
+conv1_padding=0                # padding applied on 1st conv layer
+conv1_stride=1                 # stride used in first conv layer (also subsequent layers)  
+pool_layers = np.array([2,4])  #np.array([2,4])
+                               # applying pooling after these convolutions
+                               # not using zero-based indexing here (2=the 2nd conv applied).
 
 # calculate the size of the map outputted by the 1st conv layer
-act1_map_size = Calc_Output_Map_Size( Res, conv1_filter, conv1_padding, conv1_stride )
-# then apply a padding of 2, with unchanged filter size & stride, to subequent layers to keep this map size unchanged:
-conv2_padding = 2
+# also returns the required padding to keep the actv. maps constant size.
+# Note: this will only maintain map size if filter_size is odd.
+# Otherwise the maps will get smaller by 1 pixel after every convolution, breaking the Net function below.
+act1_map_size, conv2_padding = Calc_Output_Map_Size( Res,
+                                                     conv1_filter,conv1_padding,conv1_stride,
+                                                     pool_layers, nclayers)
 conv2_filter = conv1_filter
 conv2_stride = conv1_stride
 # define the (for now) constant output channel size of the convolutional layers.
 output_channel = 128
 
-# DEFINE THE NEURAL NET
-class Net(nn.Module):
-
-    # This bit of code defines the architecture of the CNN
-    def __init__(self):
-        super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(Train_Shear.shape[1], output_channel, conv1_filter,
-                               padding=conv1_padding, stride=conv1_stride)  # Defines the first convolution:
-                                                                            # (in_channel, out_channel, filter_size)
-
-        self.conv2 = nn.Conv2d(output_channel, output_channel, conv2_filter,
-                               padding=conv2_padding, stride=conv2_stride)
-        self.fc1 = nn.Linear(output_channel*act1_map_size*act1_map_size, num_pCosmol)
-                               # act1_map_size is the num pxls on each side of the activation map output from conv layer 1
-                               # and we have chosen the padding on conv2 to keep this unchanged,
-                               # hence output_channel*act1_map_size^2 is the dimensions of the activ. map from conv2
-        
-    # ...and when called, this function executes the CNN
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        # Put the output map through conv2 as many times as nlayers dictates.
-        # Note, as long as padding=2 and stride=1, size of output maps will stay constant (124*124)
-        for nl in range(nclayers-1):
-            x = F.relu(self.conv2(x))
-        x = x.view(-1, x.shape[1]*x.shape[2]*x.shape[3])      # Last 3 numbers are output dims of previous conv.
-        x = self.fc1(x)
-        return x
-net = Net()
+# Set up the CNN architecture:
+if Net_Type == "Linear":
+    net = Linear_Net(input_channel, output_channel,
+          conv1_filter,conv1_padding,conv1_stride,
+          conv2_filter,conv2_padding,conv2_stride,
+          act1_map_size,num_pCosmol,
+          nclayers, pool_layers)
+    
 net.to(device).float()
+# Lines to test dimensionality of output from the CNN:
 #output = net(Train_Shear[0:5,:].to(device).float())
 #print("Input shape is ", Train_Shear.shape)
-#print("Output shape is ", output.shape)
+#print("Output shape is ", output.shape) 
+
 
 # Set the up the save directory for the results -
-# depends on all parameters of the data (Data_keyname)
-# and the number of layers in the CNN:
-Out_DIR = 'Results_CNN/%s/Net_convlayers%s_FClayers1' %(Data_keyname,nclayers)
+# depends on all parameters of the data (Data_keyname),
+# but modulated by whether the augmentation was performed in the training (Augment_Data-->Augment_Train),
+# whether there was multiple shape noise realisations in the training (Noise_Data-->Noise_SaveTag),
+# and on the number of layers in the CNN:
+Train_keyname = 'Mock%s_Data%s_Split%s_zBins%s_Noise%s_Aug%s_Res%s' %(mock_Type,Data_Type,Split_Type,
+                                                                     len(ZBlabel),Noise_SaveTag,
+                                                                     Augment_Train,Res)
+Out_DIR = 'Results_CNN/%s/%sNet_convlayers%s_FClayers1' %(Train_keyname,Net_Type,nclayers)
+# add on to Out_DIR if pooling was performed, and if so, on what layers (PL):
+PL="_PL"
+if len(pool_layers)>0 and nclayers>=pool_layers.min():
+    for i in range(1,nclayers+1):
+        if i in pool_layers:
+            PL+="%s-" %i
+    PL=PL[:-1] # rm final hyphen
+else:
+    PL+="None"
+Out_DIR+=PL
+
 if not os.path.exists(Out_DIR):
     os.makedirs(Out_DIR)
 
 # Make a keyword containing the parameters of the CNN architecture
 # filter size (F), padding (P), stride (S) in the 1st (conv1) & subsequent conv layers (conv2)
 # and save the number of output cosmological parameters predicted by the CNN.
-Arch_keyname = 'conv1F%sP%sS%s-conv2F%sP%sS%s_FC%sCosmol_run%s' %(conv1_filter,conv1_padding,conv1_stride,
+Arch_keyname = 'conv1F%sP%sS%s-conv2F%sP%sS%s_FC%sCosmol_Epochs' %(conv1_filter,conv1_padding,conv1_stride,
                                                                   conv2_filter,conv2_padding,conv2_stride,
-                                                                  num_pCosmol, RUN)
+                                                                  num_pCosmol)
     
 # Whether training or just testing, feed the shear maps to the CNN in batches of size:
 batch_size = 4
+
+#def Func_Train(inputs, labels):
+    # zero the parameter gradients                                                                                 
+#    optimizer.zero_grad()
+    
+    # forward + backward + optimize
+#    outputs = net(inputs.float())
+#    loss = criterion(outputs.float(), labels.float())
+#    loss.backward()
+#    optimizer.step()
+#    return loss, optimizer
 
 
 if Train_CNN:
     import torch.optim as optim
     criterion = nn.MSELoss()
+    optimizer = optim.Adam(net.parameters(), lr=lr)
 
-    #optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
-    optimizer = optim.Adam(net.parameters(), lr=0.0001)
-
+    
     t1 = time.time()
-    for epoch in range(1):
+    for epoch in range(Epochs_Tot):
         running_loss = 0.0  # value of the loss that gets updated as it trains
     
         # Feed the training set maps to the neural net in batches of
         # at a time. Therefore, create a randomised array of indicies
         # (0-->999) in sets of 5.
         rand_idx = np.arange(0,Train_Shear.shape[0])
-        np.random.seed(epoch) # Seed the randomisation, so it's reproducible
+        np.random.seed(1) # Seed the randomisation, so it's reproducible
         random.shuffle( rand_idx )
         rand_idx = np.reshape( rand_idx, ( int(len(rand_idx)/batch_size), batch_size) )
 
         for i in range( rand_idx.shape[0] ):
             inputs = Train_Shear[ rand_idx[i] ].to(device)
             labels = Train_Cosmols[ rand_idx[i] ].to(device)
+            
+            # Loop through shape noise realisations (does only one noiseless loop if Noise_Cycle is False):
+            for n_noise in range(N_Noise):
+                # train:
+                loss, optimizer = Train_CNN(net, criterion, optimizer, inputs, labels)
+                
+                if Augment_Train:
+                    # Perform 3 90deg rotations & 2 reflections of the minibatches
+                    # Annoyingly to perform the transformations, you need to convert minibatch to a numpy object
+                    inputs_np = inputs.detach().cpu().numpy()
+                    for rot in range(1,4):
+                        inputs_rot = np.rot90(inputs_np, k=rot, axes=(-2,-1))
+                        inputs_rot = torch.from_numpy( inputs_rot.copy() ).to(device)
+                        loss, optimizer = Train_CNN(net, criterion, optimizer, inputs_rot, labels)
 
-            # zero the parameter gradients
-            optimizer.zero_grad()
-
-            # forward + backward + optimize
-            outputs = net(inputs.float())
-            loss = criterion(outputs.float(), labels.float())
-            loss.backward()
-            optimizer.step()
-
-            # print statistics
+                    # First UP/DOWN FLIP
+                    inputs_ud = torch.from_numpy( inputs_np[:,:,::-1,:].copy() ).to(device) #.double() # up/down flip
+                    loss, optimizer = Train_CNN(net, criterion, optimizer, inputs_ud, labels)
+                    # Second LEFT/RIGHT FLIP
+                    inputs_lr = torch.from_numpy( inputs_np[:,:,:,::-1].copy() ).to(device) #.double() # left/right flip
+                    loss, optimizer = Train_CNN(net, criterion, optimizer, inputs_lr, labels)
+                
             running_loss += loss.item()
             if i % 10 == 9:    # print every 10 batches
                 print('[%d, %5d] loss: %.3f' %
@@ -294,68 +356,144 @@ if Train_CNN:
                 #print( outputs )
                 running_loss = 0.0
 
+                # Make a prediction for the test cosmology and save it!
+                tmp_Test_Pred = Test_CNN(net, Test_Shear, Test_Cosmols, batch_size)
+                tmp_Test_Avg, tmp_Test_Err, _ = Avg_Pred(tmp_Test_Pred, Test_Cosmols.numpy() )
+                np.save('%s/TestPredAvg_%s%s' %(Out_DIR,Arch_keyname,i), tmp_Test_Avg) # just save avg to save time.   
+                
+                
     t2 = time.time()
     print('Finished Training. Took %.1f seconds.' %(t2-t1))
     # Save the CNN
-    torch.save(net.state_dict(), '%s/Net_%s.pth' %(Out_DIR,Arch_keyname))
+    torch.save(net.state_dict(), '%s/Net_%s%s.pth' %(Out_DIR,Arch_keyname,Epochs_Tot))
 
 else:
     # Don't train, load a pre-trained CNN
-    net = Net()
-    net.to(device).float()
-    net.load_state_dict(torch.load('%s/Net_%s.pth' %(Out_DIR,Arch_keyname)))
+    net.load_state_dict( torch.load('%s/Net_%s%s.pth' %(Out_DIR,Arch_keyname,Epochs_Tot), map_location=device) )
+
+
+if Test_CNN:
+    # NOW TEST THE PERFORMANCE OF THE CNN USING THE TEST SET
+    Test_Cosmols_Pred = Test_CNN(net, Test_Shear, Test_Cosmols, batch_size)
+    # Compute an avg prediction per cosmology and corresponding error:
+    Test_Cosmols_Pred_Avg, Test_Cosmols_Pred_Err, Test_Cosmols_Unique = Avg_Pred(Test_Cosmols_Pred, Test_Cosmols.numpy() )
+    # Save output predictions:
+    np.save('%s/TestPredAvg_%s%s' %(Out_DIR,Arch_keyname,Epochs_Tot), Test_Cosmols_Pred_Avg)
+    np.save('%s/TestPredErr_%s%s' %(Out_DIR,Arch_keyname,Epochs_Tot), Test_Cosmols_Pred_Err)
+    np.save('%s/TestTrue'%Out_DIR, Test_Cosmols_Unique )
+
+else:
+    # Load the pre-saved test results
+    Test_Cosmols_Pred_Avg = np.load('%s/TestPredAvg_%s%s.npy' %(Out_DIR,Arch_keyname,Epochs_Tot))
+    Test_Cosmols_Pred_Err = np.load('%s/TestPredErr_%s%s.npy' %(Out_DIR,Arch_keyname,Epochs_Tot))
+    Test_Cosmols_Unique   = np.load('%s/TestTrue.npy'%Out_DIR)
 
 
 
-# NOW TEST THE PERFORMANCE OF THE CNN USING THE TEST SET
+    
+# ---------------------------------------- PLOTTING FUNCTIONS ----------------------------------------
 
-# Let's still feed maps to the CNN in batches
-# so we make another array of input indices
-# (doesn't need to be in random order as we're not training now).
-rand_idx_test = np.arange(0,Test_Shear.shape[0])
-rand_idx_test = np.reshape( rand_idx_test, ( int(len(rand_idx_test)/batch_size), batch_size) )
-# This is an array to store the outputs of the CNN
-Test_Cosmols_Pred = np.zeros([ Test_Shear.shape[0], Test_Cosmols.shape[1] ])
-for i in range( rand_idx_test.shape[0] ):
-    inputs = Test_Shear[ rand_idx_test[i] ].to(device)
-    labels = Test_Cosmols[ rand_idx_test[i] ].to(device)
-    outputs = net(inputs.float())
-    # Store the output predictions
-    Test_Cosmols_Pred[i*batch_size:(i+1)*batch_size, :] = outputs.detach().cpu().numpy()
 
-# The CNN has produced many predictions at each cosmology.
-# Compute an avg prediction per cosmology and corresponding error.
-# Provide it with the corresponding test cosmols, so it can sort the predictions by what cosmology they correspond to.
-Test_Cosmols_Pred_Avg, Test_Cosmols_Pred_Err, Test_Cosmols_Unique = Avg_Pred(Test_Cosmols_Pred, Test_Cosmols.numpy() )
-# Save output predictions:
-np.save('%s/TestPredAvg_%s' %(Out_DIR,Arch_keyname), Test_Cosmols_Pred_Avg)
-np.save('%s/TestPredErr_%s' %(Out_DIR,Arch_keyname), Test_Cosmols_Pred_Err)
-np.save('%s/TestTrue'%Out_DIR, Test_Cosmols_Unique )
-
-# Plot the accuracy results
-savename = '%s/PlotAcc_%s.png' %(Out_DIR, Arch_keyname)
+# Plot the accuracy results  
+savename = '%s/PlotAcc_%s%s.png' %(Out_DIR, Arch_keyname,Epochs_Tot)
 #Plot_Accuracy( Test_Cosmols_Pred_Avg, Test_Cosmols_Pred_Err,
 #               Test_Cosmols_Unique,
-#               Test_mockIDs, savename)
+#               Test_mockIDs, savename) 
 
 
 Run_Multilayers = False
 if Run_Multilayers:
     # Read in the results for multiple CNN architectures,
     # i.e. changing in number of conv layers, and plot how the accuracy changes nclayers:
-    multi_layers = np.arange(1,11)
+    #multi_layers = [1,2,3,4,5,6,7,8,9,10,15,20] #np.arange(1,11)
+    multi_layers = [1,5,10,15,20]
+    
     Test_Cosmols_Pred_Avg_Stack = np.zeros([ Test_Cosmols_Pred_Avg.shape[0],
                                          Test_Cosmols_Pred_Avg.shape[1], len(multi_layers) ])
     Test_Cosmols_Pred_Err_Stack = np.zeros_like( Test_Cosmols_Pred_Avg_Stack )
+
     for i in range( len(multi_layers) ):
         tmp_Out_DIR = Out_DIR.split('convlayers')[0] + 'convlayers%s_FC'%multi_layers[i] + Out_DIR.split('FC')[-1]
         Test_Cosmols_Pred_Avg_Stack[:,:,i] = np.load('%s/TestPredAvg_%s.npy' %(tmp_Out_DIR,Arch_keyname))
         Test_Cosmols_Pred_Err_Stack[:,:,i] = np.load('%s/TestPredErr_%s.npy' %(tmp_Out_DIR,Arch_keyname))
 
-    multi_savename = '%s/Plot-Nclayers%s-%s_%s.png' %(tmp_Out_DIR, multi_layers[0], multi_layers[1], Arch_keyname)
-    Plot_Accuracy_vs_nlayers(multi_layers,
-                             Test_Cosmols_Pred_Avg_Stack,
-                             Test_Cosmols_Pred_Err_Stack,
-                             Test_Cosmols_Unique,
-                             Test_mockIDs,
-                             multi_savename)
+        
+    multi_savename = '%s/Plot-Nclayers%s-%s_%s.png' %(tmp_Out_DIR, multi_layers[0], multi_layers[-1], Arch_keyname)
+    ylimit_acc = [[-40.,40.], [-40.,40.], [-40.,40.], [-40.,40.]]
+    ylimit_raw = [[0.2,0.39], [0.7,0.85], [0.69,0.72], [-1.4, -1.1]]
+    Plot_Accuracy_vs_Q(multi_layers,
+                       Test_Cosmols_Pred_Avg_Stack,
+                       Test_Cosmols_Pred_Err_Stack,
+                       Test_Cosmols_Unique,
+                       Test_mockIDs,
+                       r'$N_{\rm conv-layers}$',
+                       multi_savename,
+                       ylimit_acc)
+
+    Plot_Pred_vs_Q(multi_layers,
+                   Test_Cosmols_Pred_Avg_Stack,
+                   Test_Cosmols_Pred_Err_Stack,
+                   Test_Cosmols_Unique,
+                   Test_mockIDs,
+                   r'$N_{\rm conv-layers}$',
+                   multi_savename,
+                   ylimit_raw)
+
+
+Run_Multifilters = False
+if Run_Multifilters:
+    # Plot the average accuracy for multiple filter sizes used in the convolutions
+    multi_filters = [1,3,5,7,9]
+    multi_padding = [0,1,2,3,4] # conv2 padding changes with filter-size to preserve actv. map size.
+    Test_Cosmols_Pred_Avg_Stack = np.zeros([ Test_Cosmols_Pred_Avg.shape[0],
+                                             Test_Cosmols_Pred_Avg.shape[1], len(multi_filters) ])
+    Test_Cosmols_Pred_Err_Stack = np.zeros_like( Test_Cosmols_Pred_Avg_Stack )
+    for i in range( len(multi_filters) ):
+        tmp_Arch_keyname = 'conv1F%sP%sS%s-conv2F%sP%sS%s_FC%sCosmol_run%s' %(multi_filters[i],conv1_padding,conv1_stride,
+                                                                              multi_filters[i],multi_padding[i],conv2_stride,
+                                                                              num_pCosmol, RUN)
+        Test_Cosmols_Pred_Avg_Stack[:,:,i] = np.load('%s/TestPredAvg_%s.npy' %(Out_DIR,tmp_Arch_keyname))
+        Test_Cosmols_Pred_Err_Stack[:,:,i] = np.load('%s/TestPredErr_%s.npy' %(Out_DIR,tmp_Arch_keyname))
+
+    multi_savename = '%s/Plot-Filter%s-%s_%s.png' %(Out_DIR, multi_filters[0], multi_filters[-1], Arch_keyname)
+    ylimits = [-40.,40.]
+    Plot_Accuracy_vs_Q(multi_filters,
+                       Test_Cosmols_Pred_Avg_Stack,
+                       Test_Cosmols_Pred_Err_Stack,
+                       Test_Cosmols_Unique,
+                       Test_mockIDs,
+                       r'Filter size [pxl]',
+                       multi_savename, ylimits)
+
+
+Run_MultiEpochs = False
+if Run_MultiEpochs:
+    multi_epochs = [1,3,5,7,10,15] #,20,25,30,35,40]
+    Test_Cosmols_Pred_Avg_Stack = np.zeros([ Test_Cosmols_Pred_Avg.shape[0],
+                                             Test_Cosmols_Pred_Avg.shape[1], len(multi_epochs) ])
+    Test_Cosmols_Pred_Err_Stack = np.zeros_like( Test_Cosmols_Pred_Avg_Stack )
+    for i in range( len(multi_epochs) ):
+        # read i data for various epochs
+        tmp_Arch_keyname = 'conv1F%sP%sS%s-conv2F%sP%sS%s_FC%sCosmol_run%s' %(conv1_filter,conv1_padding,conv1_stride,
+                                                                              conv2_filter,conv2_padding,conv2_stride,
+                                                                              num_pCosmol, multi_epochs[i])
+        Test_Cosmols_Pred_Avg_Stack[:,:,i] = np.load('%s/TestPredAvg_%s.npy' %(Out_DIR,tmp_Arch_keyname))
+        Test_Cosmols_Pred_Err_Stack[:,:,i] = np.load('%s/TestPredErr_%s.npy' %(Out_DIR,tmp_Arch_keyname))
+
+    # Renormalise the accuracies to be % differences from those obtained for the max num of epochs
+    # need factor of Test_Cosmols_Unique into cancel factor in the Plot_Acc function.
+    Test_Cosmols_Pred_Avg_Stack_Norm = np.copy(Test_Cosmols_Pred_Avg_Stack)
+    Test_Cosmols_Pred_Err_Stack_Norm = np.copy(Test_Cosmols_Pred_Avg_Stack)
+    for i in range(Test_Cosmols_Pred_Avg_Stack.shape[2]):
+        Test_Cosmols_Pred_Avg_Stack_Norm[:,:,i] = Test_Cosmols_Unique* Test_Cosmols_Pred_Avg_Stack[:,:,i] / Test_Cosmols_Pred_Avg_Stack[:,:,-1]
+        Test_Cosmols_Pred_Err_Stack_Norm[:,:,i] = Test_Cosmols_Unique* Test_Cosmols_Pred_Err_Stack[:,:,i] / Test_Cosmols_Pred_Avg_Stack[:,:,-1]
+
+    multi_savename = '%s/Plot-Epochs%s-%s_%s.png' %(Out_DIR, multi_epochs[0], multi_epochs[-1], Arch_keyname)
+    ylimits = [-10.,10.]
+    Plot_Accuracy_vs_Q(multi_epochs,
+                       Test_Cosmols_Pred_Avg_Stack_Norm,
+                       Test_Cosmols_Pred_Err_Stack_Norm,
+                       Test_Cosmols_Unique,
+                       Test_mockIDs,
+                       r'Number of epochs',
+                       multi_savename, ylimits)

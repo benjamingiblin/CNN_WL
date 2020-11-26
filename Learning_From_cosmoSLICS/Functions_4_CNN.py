@@ -50,7 +50,16 @@ def Slow_Read(CS_DIR, mock_Type, Cosmols_Raw, mockIDs, Train_mockIDs, Test_mockI
         # Reading in only the map itself
         aug_f=1
         aug_cycle = ['']
-    
+
+    if Noise == "None":
+        SN = ["None", "None", "None", "None", "None"]
+    elif Noise == "On":
+        if len(ZBlabel)>1:
+            # set it to KiDS1000 levels:
+            SN = [0.27, 0.258, 0.273, 0.254, 0.27]
+        else:
+            # set it to the default value I used for KiDS-450:
+            SN = [0.28]
 
     # Start preparing the arrays to store the shear maps & corresponding cosmological parameters:
     Shear = np.zeros([ len(mockIDs)*2*Realisations*4*aug_f, 2*len(ZBlabel), Res,Res ])
@@ -99,7 +108,7 @@ def Slow_Read(CS_DIR, mock_Type, Cosmols_Raw, mockIDs, Train_mockIDs, Test_mockI
 
                                 # Open the map
                                 f = fits.open(CS_DIR+'%s_%s/%s/Shear_Maps/Res%sx%s/%s/Shear%s_LOS%s_SN%s_Quad%s%s.fits'
-                                    %(mockIDs[i],seed,mock_Type,Res,Res,ZBlabel[zb],s+1,r+1,Noise,q,ac))
+                                    %(mockIDs[i],seed,mock_Type,Res,Res,ZBlabel[zb],s+1,r+1,SN[zb],q,ac))
                         
                                 Shear[map_count,channel_count,:,:] = f[0].data # store shear
                                 Cosmols[map_count,:] = Cosmols_Raw[i,:]        # and corresponding cosmols
@@ -150,6 +159,81 @@ def Untransform_Data(data, mean, std):
     return new_data
 
 
+def Calc_Output_Map_Size(initial_size, F, P, S, pool_layers, nclayers):
+    # calculate the size of the map outputted by the 1st conv layer,
+    # & the padding needed to keep the actv. maps constant size with each subsequent conv.
+    # If padding is specified by pool_layers,
+    # then take into account how the actv map size reduces each time pooling is applied.
+    # Note: this will only maintain map size if filter_size is odd.
+    # Otherwise the maps will get smaller by 1 pixel after every convolution,
+    # and this will break the Net() class defined in Classes_2_CNN.py (true as of 25/11/20).
+    
+    output_size = float(initial_size - F + 2*P) / S
+    if output_size == int(output_size):
+        # if integer, add one
+        add = 1
+    else:
+        # if non-integer, need to add 0.5
+        add = 0.5
+    output_size += add
+
+    # How many times are we pooling? This will reduce output dimensions by 1/2 per pool.
+    # only count the pooling layers that are <= the number on conv layers:
+    len_pool = len(np.where(pool_layers<=nclayers)[0])
+    output_size = output_size * 0.5**len_pool
+
+    # calculate the padding needed in subsequent conv's to maintain the map size.
+    # this is a simple rearrangement of the above formula, setting in/out-put sizes equal.
+    # NOTE: filter size must be odd for this to work.
+    conv2_padding = int(0.5*((output_size-add)*S +F -output_size))
+    return int(output_size), conv2_padding
+
+def Train_CNN(net, criterion, optimizer, inputs, labels):
+    # zero the parameter gradients
+    optimizer.zero_grad()
+
+    # forward + backward + optimize
+    outputs = net(inputs.float())
+    loss = criterion(outputs.float(), labels.float())
+    loss.backward()
+    optimizer.step()
+    return loss, optimizer
+
+def Test_CNN(net, Test_Data, Test_Labels, batch_size):
+    # make minibatches of test data                                                                                                             
+    rand_idx_test = np.arange(0,Test_Data.shape[0])
+    rand_idx_test = np.reshape( rand_idx_test, ( int(len(rand_idx_test)/batch_size), batch_size) )
+    # This is an array to store the outputs of the CNN
+    Test_Pred = np.zeros([ Test_Data.shape[0], Test_Labels.shape[1] ])
+    for i in range( rand_idx_test.shape[0] ):
+        inputs = Test_Data[ rand_idx_test[i] ].to(device)
+        labels = Test_Labels[ rand_idx_test[i] ].to(device)
+        outputs = net(inputs.float())
+        # Store the output predictions
+        Test_Pred[i*batch_size:(i+1)*batch_size, :] = outputs.detach().cpu().numpy()
+    return Test_Pred
+
+
+
+
+def Generate_Shape_Noise(seed, batch_size, input_channel, Res, neff, sigma_e):
+    f = int( input_channel / len(neff) ) # (1,2,3) for (Kappa-only, Shear-only, Kappa+Shear)
+    neff = np.repeat(neff, f)            # neff per input channel
+    sigma_e = np.repeat(sigma_e,f)       # sigma_e per input channel
+    pxl_size = (5.*60. / Res)**2         # in arcmin^2 (5deg on side, assumes map split into quads).
+    sigma_noise = sigma_e / np.sqrt( pxl_size*neff )
+
+    # make shape noise realisations:
+    noise = np.zeros([batch_size, input_channel, Res, Res])
+    for i in range( input_channel ):
+        np.random.seed(seed+i)       # different noise per channel
+        noise[:,i,:,:] = np.random.normal(0, sigma_noise[i], [batch_size,Res,Res])
+    return noise
+
+
+
+
+
 def Avg_Pred(pred,test):
     
     # This read in the test set predictions for every single realisation and cosmology,
@@ -191,12 +275,15 @@ def Plot_Accuracy(pred_avg, pred_err, test_unique, xtick_labels, savename):
     plot_labels = [ r'$\Omega_{\rm m}$', r'$S_8$', r'$h$', r'$w_0$' ]
     for j in range( test_unique.shape[1] ):           # scroll through (Omega_m, S_8, h, w0) 
         ax = plt.subplot(gs1[j], adjustable='box')
+        # plot the perfect accuracy line
+        ax.plot( np.arange( test_unique.shape[0] )+1, np.zeros( test_unique.shape[0]), 'k-', linewidth=2)
         ax.errorbar( np.arange( test_unique.shape[0] )+1,
                      100.*(pred_avg[:,j]/test_unique[:,j] -1.),
                      yerr=100.*( pred_err[:,j]/test_unique[:,j] ),
-                     color=colors[j], fmt='o')
+                     color=colors[j], fmt='o', markersize=10)
         ax.set_ylabel(r'%s Accuracy' %plot_labels[j] + r' [%]')
         ax.set_xlabel(r'cosmoSLICS ID')
+        ax.grid(which='major', axis='both')
         plt.sca(ax)
         plt.xticks(np.arange( test_unique.shape[0] )+1, xtick_labels)
     plt.subplots_adjust(hspace=0)
@@ -204,8 +291,8 @@ def Plot_Accuracy(pred_avg, pred_err, test_unique, xtick_labels, savename):
     #plt.show()
     return
 
-def Plot_Accuracy_vs_nlayers(nlayers,pred_avg, pred_err, test_unique, labels, savename):
-    # Plot the accuracy of the CNN vs number of conv layers
+def Plot_Accuracy_vs_Q(Q,pred_avg, pred_err, test_unique, labels, xlabel, savename, ylimits):
+    # Plot the accuracy of the CNN vs a quantity Q, e.g., num of layers or filter size.
     # input is array containing numbers of layers
     # and the avg predictions, errors and true values per cosmology.
     fig = plt.figure(figsize = (12,9))
@@ -219,20 +306,67 @@ def Plot_Accuracy_vs_nlayers(nlayers,pred_avg, pred_err, test_unique, labels, sa
     gs1 = gridspec.GridSpec(2, nrows )
     colors = [ 'magenta', 'darkblue', 'lawngreen', 'orange', 'cyan', 'red', 'dimgrey' ]
     plot_labels = [ r'$\Omega_{\rm m}$', r'$S_8$', r'$h$', r'$w_0$' ]
+    # Find the value of Q that optimises Acc for each param. 
+    Acc_perQ = np.zeros([ test_unique.shape[1], len(Q)  ])   
+    opt_Q = np.zeros( test_unique.shape[1] )          # store optimal Q value per cosmol. param.
+    
     for j in range( test_unique.shape[1] ):           # scroll through (Omega_m, S_8, h, w0)
         ax = plt.subplot(gs1[j], adjustable='box')
         for i in range(pred_avg.shape[0]):            # scroll through each of the test cosmologies
-            # plot the acc. for this test cosmol & param, vs number of layers
-            ax.errorbar( nlayers,
+            # plot the acc. for this test cosmol & param, vs quantity Q
+            ax.errorbar( Q,
                          100.*(pred_avg[i,j,:]/test_unique[i,j] -1.),
                          yerr=100.*( pred_err[i,j,:]/test_unique[i,j] ),
                          color=colors[i], linewidth=2,label=r'%s'%labels[i] )
-        ax.set_ylabel(r'%s Accuracy' %plot_labels[j] + r' [%]')
-        ax.set_xlabel(r'$N_{\rm layers}$')
-        ax.set_ylim([-40., 40.])
-    ax.legend(loc='best', frameon=False)
+        ax.grid(which='major', axis='both')
+        ax.set_ylabel(r'%s Accuracy' %(plot_labels[j])+r' [%]' )
+        ax.set_xlabel(xlabel)
+        ax.set_ylim(ylimits[j])
+        for q in range(len(Q)):
+            # calculate the total accuracy across the test cosmols for each value of Q
+            Acc_perQ[j,q] = np.sum(  abs((pred_avg[:,j,q]/test_unique[:,j] -1.))  )
+        opt_Q[j] = Q[ np.argmin( Acc_perQ[j,:] ) ]
+    print("The optimal value of %s per cosmol. param is: "%xlabel, opt_Q)
+    ax.legend(loc='best', framealpha=0.5)
     plt.subplots_adjust(hspace=0)
     plt.savefig( savename )
     plt.show()
     return
 
+
+
+def Plot_Pred_vs_Q(Q,pred_avg, pred_err, test_unique, labels, xlabel, savename, ylimits):
+    # Plot the raw predictions of the CNN, & the true values, vs a quantity Q, e.g., num of layers or filter size.
+    # input is array containing numbers of layers
+    # and the avg predictions, errors and true values per cosmology.
+
+    fig = plt.figure(figsize = (12,9))
+    if pred_avg.shape[1] % 2 ==0:
+        # an even number of panels to produce                                                                                      
+        nrows = int(pred_avg.shape[1]/2)
+    else:
+        # odd number of panels, round up number of rows
+        nrows = int(pred_avg.shape[1]/2) + 1
+
+    gs1 = gridspec.GridSpec(2, nrows )
+    colors = [ 'magenta', 'darkblue', 'lawngreen', 'orange', 'cyan', 'red', 'dimgrey' ]
+    plot_labels = [ r'$\Omega_{\rm m}$', r'$S_8$', r'$h$', r'$w_0$' ]
+
+    for j in range( test_unique.shape[1] ):           # scroll through (Omega_m, S_8, h, w0)
+        ax = plt.subplot(gs1[j], adjustable='box')
+        for i in range(pred_avg.shape[0]):            # scroll through each of the test cosmologies
+            # plot the raw pred for this test cosmol & param, vs quantity Q
+            ax.plot( [Q[0],Q[-1]], [test_unique[i,j], test_unique[i,j]], linestyle=':', linewidth=2, color=colors[i] )
+            ax.errorbar( Q,
+                         pred_avg[i,j,:],
+                         yerr=pred_err[i,j,:],
+                         color=colors[i], linewidth=2,label=r'%s'%labels[i] )
+        ax.grid(which='major', axis='both')
+        ax.set_ylabel(r'Raw %s' %(plot_labels[j]) )
+        ax.set_xlabel(xlabel)
+        ax.set_ylim(ylimits[j])
+    ax.legend(loc='best', framealpha=0.5)
+    plt.subplots_adjust(hspace=0)
+    plt.savefig( savename )
+    plt.show()
+    return
