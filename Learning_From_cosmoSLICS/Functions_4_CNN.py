@@ -22,7 +22,6 @@
 # More info on cosmoSLICS can be found in Harnois-Deraps, Giblin and Joachimi (2019):
 # https://arxiv.org/pdf/1905.06454.pdf
 
-
 import numpy as np                                # Useful for managing/reading data
 from astropy.io import fits                       # For reading FITS files
 import time                                       # Used to time parts of the code.
@@ -39,6 +38,10 @@ font = {'family' : 'serif',
         'size'   : 14} # 19                                                                                                                    
 plt.rc('font', **font)
 
+# Following are used by Transform_And_Train:
+import torch
+# find GPU device if available, else use CPU
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 def Slow_Read(CS_DIR, mock_Type, Cosmols_Raw, mockIDs, Train_mockIDs, Test_mockIDs,
               Realisations, ZBlabel, Res, Test_Realisation_num, Noise, Augment):
@@ -188,6 +191,7 @@ def Calc_Output_Map_Size(initial_size, F, P, S, pool_layers, nclayers):
     conv2_padding = int(0.5*((output_size-add)*S +F -output_size))
     return int(output_size), conv2_padding
 
+
 def Train_CNN(net, criterion, optimizer, inputs, labels):
     # zero the parameter gradients
     optimizer.zero_grad()
@@ -197,7 +201,7 @@ def Train_CNN(net, criterion, optimizer, inputs, labels):
     loss = criterion(outputs.float(), labels.float())
     loss.backward()
     optimizer.step()
-    return loss, optimizer
+    return net, loss, optimizer
 
 def Test_CNN(net, Test_Data, Test_Labels, batch_size):
     # make minibatches of test data                                                                                                             
@@ -213,7 +217,23 @@ def Test_CNN(net, Test_Data, Test_Labels, batch_size):
         Test_Pred[i*batch_size:(i+1)*batch_size, :] = outputs.detach().cpu().numpy()
     return Test_Pred
 
+def Transform_And_Train(net, criterion, optimizer, inputs, labels):
+    # Perform 3 90deg rotations & 2 reflections of the minibatches
+    # Annoyingly to perform the transformations, you need to convert minibatch to a numpy object
+    
+    inputs_np = inputs.detach().cpu().numpy()
+    for rot in range(1,4):
+        inputs_rot = np.rot90(inputs_np, k=rot, axes=(-2,-1))
+        inputs_rot = torch.from_numpy( inputs_rot.copy() ).to(device)
+        net, loss, optimizer = Train_CNN(net, criterion, optimizer, inputs_rot, labels)
 
+    # First UP/DOWN FLIP                                                                                            
+    inputs_ud = torch.from_numpy( inputs_np[:,:,::-1,:].copy() ).to(device) #.double() # up/down flip               
+    net, loss, optimizer = Train_CNN(net, criterion, optimizer, inputs_ud, labels)
+    # Second LEFT/RIGHT FLIP                                                                                        
+    inputs_lr = torch.from_numpy( inputs_np[:,:,:,::-1].copy() ).to(device) #.double() # left/right flip            
+    net, loss, optimizer = Train_CNN(net, criterion, optimizer, inputs_lr, labels)
+    return net, loss, optimizer
 
 
 def Generate_Shape_Noise(seed, batch_size, input_channel, Res, neff, sigma_e):

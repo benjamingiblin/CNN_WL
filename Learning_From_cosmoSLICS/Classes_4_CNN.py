@@ -28,7 +28,7 @@ class Linear_Net(nn.Module):
                          conv2_filter,conv2_padding,conv2_stride,
                          act1_map_size,num_pCosmol,
                          nclayers, pool_layers):
-        super(Net, self).__init__()
+        super(Linear_Net, self).__init__()
         
         # Parameters defining the architecture
         self.input_channel = input_channel

@@ -32,7 +32,7 @@ import random
 from scipy.ndimage import gaussian_filter as gauss
 from Classes_4_CNN import Linear_Net
 from Functions_4_CNN import Slow_Read, Transform_Data, Untransform_Data, Calc_Output_Map_Size, Train_CNN, Test_CNN
-from Functions_4_CNN import Avg_Pred, Plot_Accuracy, Plot_Accuracy_vs_Q, Plot_Pred_vs_Q
+from Functions_4_CNN import Transform_And_Train, Avg_Pred, Plot_Accuracy, Plot_Accuracy_vs_Q, Plot_Pred_vs_Q
 
 import torch          # main neural net module
 import torch.nn as nn
@@ -40,10 +40,11 @@ import torch.nn.functional as F
 # find GPU device if available, else use CPU
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-Train_CNN = True              # If True it will train the CNN (obviously)
-                              # If False it will read a pre-saved CNN
-Test_CNN = True               # If True, runs the CNN on the test cosmologies
-                              # Otherwise it reads in the pre-saved results
+Perform_Train = True              # If True it will train the CNN (obviously)
+                                  # If False it will read a pre-saved CNN
+Perform_Test = True               # If True, runs the CNN on the test cosmologies
+                                  # every 5 epochs in training, and at the end of training.
+                                  # If False it reads in the pre-saved results
 
 Net_Type = "Linear" # If Linear, then conv layers are applied sequentially (no residual layers).
 
@@ -87,8 +88,8 @@ else:
 if Noise_SaveTag == "None":
     lr=5e-6
 else:
-    lr="Not sure..."          # tried doen to 1e-8, get problems with fixed shape noise.        
-
+    lr=5e-6          # tried doen to 1e-8, get problems with fixed shape noise.        
+    
 Res = 128                     # The number of pxls on each side of the maps
 nclayers = int(sys.argv[1])   # The number of conv. layers to have in the CNN
                               # The number of fully connected (FC) layers is currently fixed to 1.
@@ -141,7 +142,8 @@ CS_DIR = '/home/bengib/cosmoSLICS/'          # cosmoSLICS directory
 # Read in the cosmological parameters                                                                                         
 # These will be the output of the neural net
 num_pCosmol = 4 # The number of cosmol. params to read in and predict with the CNN
-Cosmols_Raw = np.loadtxt(CS_DIR+'/cosmoSLICS_Cosmologies_Omm-S8-h-w0-sig8-sig8bf.dat')[:,0:num_pCosmol] # Only take the frst n columns
+Cosmols_Raw = np.loadtxt(CS_DIR+'/cosmoSLICS_Cosmologies_Omm-S8-h-w0-sig8-sig8bf.dat')[:,0:num_pCosmol]
+                
 
 # Establish the in/output subdirectory anme, where the trained CNN & data will be saved (or loaded from).
 # Make the output directory different for each mock suite, data tpye (shear/kappa),
@@ -229,7 +231,7 @@ else:
 # Define the padding, stride & filter sizes to be used in the CNN layers
 conv1_padding=0                # padding applied on 1st conv layer
 conv1_stride=1                 # stride used in first conv layer (also subsequent layers)  
-pool_layers = np.array([2,4])  #np.array([2,4])
+pool_layers = np.array([2,4,6])  #np.array([2,4])
                                # applying pooling after these convolutions
                                # not using zero-based indexing here (2=the 2nd conv applied).
 
@@ -293,19 +295,7 @@ Arch_keyname = 'conv1F%sP%sS%s-conv2F%sP%sS%s_FC%sCosmol_Epochs' %(conv1_filter,
 # Whether training or just testing, feed the shear maps to the CNN in batches of size:
 batch_size = 4
 
-#def Func_Train(inputs, labels):
-    # zero the parameter gradients                                                                                 
-#    optimizer.zero_grad()
-    
-    # forward + backward + optimize
-#    outputs = net(inputs.float())
-#    loss = criterion(outputs.float(), labels.float())
-#    loss.backward()
-#    optimizer.step()
-#    return loss, optimizer
-
-
-if Train_CNN:
+if Perform_Train:
     import torch.optim as optim
     criterion = nn.MSELoss()
     optimizer = optim.Adam(net.parameters(), lr=lr)
@@ -330,36 +320,25 @@ if Train_CNN:
             # Loop through shape noise realisations (does only one noiseless loop if Noise_Cycle is False):
             for n_noise in range(N_Noise):
                 # train:
-                loss, optimizer = Train_CNN(net, criterion, optimizer, inputs, labels)
+                net, loss, optimizer = Train_CNN(net, criterion, optimizer, inputs, labels)
                 
                 if Augment_Train:
-                    # Perform 3 90deg rotations & 2 reflections of the minibatches
-                    # Annoyingly to perform the transformations, you need to convert minibatch to a numpy object
-                    inputs_np = inputs.detach().cpu().numpy()
-                    for rot in range(1,4):
-                        inputs_rot = np.rot90(inputs_np, k=rot, axes=(-2,-1))
-                        inputs_rot = torch.from_numpy( inputs_rot.copy() ).to(device)
-                        loss, optimizer = Train_CNN(net, criterion, optimizer, inputs_rot, labels)
-
-                    # First UP/DOWN FLIP
-                    inputs_ud = torch.from_numpy( inputs_np[:,:,::-1,:].copy() ).to(device) #.double() # up/down flip
-                    loss, optimizer = Train_CNN(net, criterion, optimizer, inputs_ud, labels)
-                    # Second LEFT/RIGHT FLIP
-                    inputs_lr = torch.from_numpy( inputs_np[:,:,:,::-1].copy() ).to(device) #.double() # left/right flip
-                    loss, optimizer = Train_CNN(net, criterion, optimizer, inputs_lr, labels)
+                    net, loss, optimizer = Transform_And_Train(net, criterion, optimizer, inputs, labels)
                 
             running_loss += loss.item()
-            if i % 10 == 9:    # print every 10 batches
+            if i % 10 == 0:    # print every 10 batches
                 print('[%d, %5d] loss: %.3f' %
                       (epoch + 1, i + 1, running_loss/10 ))
                 #print( labels )
                 #print( outputs )
                 running_loss = 0.0
 
-                # Make a prediction for the test cosmology and save it!
-                tmp_Test_Pred = Test_CNN(net, Test_Shear, Test_Cosmols, batch_size)
-                tmp_Test_Avg, tmp_Test_Err, _ = Avg_Pred(tmp_Test_Pred, Test_Cosmols.numpy() )
-                np.save('%s/TestPredAvg_%s%s' %(Out_DIR,Arch_keyname,i), tmp_Test_Avg) # just save avg to save time.   
+
+        if (epoch+1) % 5 == 0 and Perform_Test:
+            # Make a prediction for the test cosmology every 5 epochs
+            tmp_Test_Pred = Test_CNN(net, Test_Shear, Test_Cosmols, batch_size)
+            tmp_Test_Avg, tmp_Test_Err, _ = Avg_Pred(tmp_Test_Pred, Test_Cosmols.numpy() )
+            np.save('%s/TestPredAvg_%s%s' %(Out_DIR,Arch_keyname,epoch+1), tmp_Test_Avg) 
                 
                 
     t2 = time.time()
@@ -372,7 +351,7 @@ else:
     net.load_state_dict( torch.load('%s/Net_%s%s.pth' %(Out_DIR,Arch_keyname,Epochs_Tot), map_location=device) )
 
 
-if Test_CNN:
+if Perform_Test:
     # NOW TEST THE PERFORMANCE OF THE CNN USING THE TEST SET
     Test_Cosmols_Pred = Test_CNN(net, Test_Shear, Test_Cosmols, batch_size)
     # Compute an avg prediction per cosmology and corresponding error:
