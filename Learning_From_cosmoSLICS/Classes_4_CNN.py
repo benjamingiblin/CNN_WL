@@ -2,9 +2,12 @@
 # This code contains classes for convolutional neural network analyses
 
 import numpy as np
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# find GPU device if available, else use CPU
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         
 class Linear_Net(nn.Module):
     
@@ -68,4 +71,65 @@ class Linear_Net(nn.Module):
         return x
 
 
+class Train_CNN_Class:
+
+    def __init__(self, net, criterion, optimizer):
+        self.net=net
+        self.criterion=criterion
+        self.optimizer=optimizer
+
+    def Train_CNN(self, inputs, labels):
+        # zero the parameter gradients
+        self.optimizer.zero_grad()
+
+        # forward + backward + optimize
+        outputs = self.net(inputs.float())
+        loss = self.criterion(outputs.float(), labels.float())
+        loss.backward()
+        self.optimizer.step()
+        return loss
+
+    def Transform_And_Train(self, inputs, labels):
+        # Perform 3 90deg rotations & 2 reflections of the minibatches
+        # Annoyingly to perform the transformations, you need to convert minibatch to a numpy object
+
+        inputs_np = inputs.detach().cpu().numpy()
+        for rot in range(1,4):
+            inputs_rot = np.rot90(inputs_np, k=rot, axes=(-2,-1))
+            inputs_rot = torch.from_numpy( inputs_rot.copy() ).to(device)
+            loss = self.Train_CNN(inputs_rot, labels)
+
+        # First UP/DOWN FLIP
+        inputs_ud = torch.from_numpy( inputs_np[:,:,::-1,:].copy() ).to(device) #.double() # up/down flip
+        loss = self.Train_CNN(inputs_ud, labels)
+        # Second LEFT/RIGHT FLIP
+        inputs_lr = torch.from_numpy( inputs_np[:,:,:,::-1].copy() ).to(device) #.double() # left/right flip
+        loss = self.Train_CNN(inputs_lr, labels)
+        return loss
+
+
+    
         
+class Test_CNN_Class:
+    
+    def __init__(self, net, Test_Data, Test_Labels, batch_size):
+        self.net=net
+        self.Test_Data=Test_Data
+        self.Test_Labels=Test_Labels
+        self.batch_size=batch_size
+        # Assemble minibatches & array to store them in.
+        self.rand_idx_test = np.arange(0, Test_Data.shape[0])
+        self.rand_idx_test = np.reshape( self.rand_idx_test, ( int(len(self.rand_idx_test)/batch_size), batch_size) )
+        self.Test_Pred = np.zeros([ Test_Data.shape[0], Test_Labels.shape[1] ])
+        
+    def Test_CNN(self):
+        # Scroll through the minibatches
+        for i in range( self.rand_idx_test.shape[0] ):
+            inputs = self.Test_Data[ self.rand_idx_test[i] ].to(device)
+            labels = self.Test_Labels[ self.rand_idx_test[i] ].to(device)
+            outputs = self.net(inputs.float())
+            # Store the output predictions
+            Test_Pred[i*self.batch_size:(i+1)*self.batch_size, :] = outputs.detach().cpu().numpy()
+        return Test_Pred
+
+    

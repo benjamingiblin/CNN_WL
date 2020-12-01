@@ -30,9 +30,9 @@ import sys                                        # Used to exit code w/o error 
 import os
 import random
 from scipy.ndimage import gaussian_filter as gauss
-from Classes_4_CNN import Linear_Net
-from Functions_4_CNN import Slow_Read, Transform_Data, Untransform_Data, Calc_Output_Map_Size, Train_CNN, Test_CNN
-from Functions_4_CNN import Transform_And_Train, Avg_Pred, Plot_Accuracy, Plot_Accuracy_vs_Q, Plot_Pred_vs_Q
+from Classes_4_CNN import Linear_Net, Train_CNN_Class, Test_CNN_Class
+from Functions_4_CNN import Slow_Read, Transform_Data, Untransform_Data, Calc_Output_Map_Size #, Train_CNN, Test_CNN, Transform_And_Train
+from Functions_4_CNN import Avg_Pred, Plot_Accuracy, Plot_Accuracy_vs_Q, Plot_Pred_vs_Q
 
 import torch          # main neural net module
 import torch.nn as nn
@@ -231,7 +231,7 @@ else:
 # Define the padding, stride & filter sizes to be used in the CNN layers
 conv1_padding=0                # padding applied on 1st conv layer
 conv1_stride=1                 # stride used in first conv layer (also subsequent layers)  
-pool_layers = np.array([2,4,6])  #np.array([2,4])
+pool_layers = np.array([2,4])  #np.array([2,4])
                                # applying pooling after these convolutions
                                # not using zero-based indexing here (2=the 2nd conv applied).
 
@@ -299,7 +299,8 @@ if Perform_Train:
     import torch.optim as optim
     criterion = nn.MSELoss()
     optimizer = optim.Adam(net.parameters(), lr=lr)
-
+    TrCNN = Train_CNN_Class(net, criterion, optimizer) 
+    TeCNN = Test_CNN_Class(net, Test_Shear, Test_Cosmols, batch_size)
     
     t1 = time.time()
     for epoch in range(Epochs_Tot):
@@ -320,11 +321,13 @@ if Perform_Train:
             # Loop through shape noise realisations (does only one noiseless loop if Noise_Cycle is False):
             for n_noise in range(N_Noise):
                 # train:
-                net, loss, optimizer = Train_CNN(net, criterion, optimizer, inputs, labels)
+                #net, loss, optimizer = Train_CNN(net, criterion, optimizer, inputs, labels)
+                loss = TrCNN.Train_CNN(inputs, labels)
                 
                 if Augment_Train:
-                    net, loss, optimizer = Transform_And_Train(net, criterion, optimizer, inputs, labels)
-                
+                    #net, loss, optimizer = Transform_And_Train(net, criterion, optimizer, inputs, labels)
+                    loss = TrCNN.Transform_And_Train(inputs, labels)
+                    
             running_loss += loss.item()
             if i % 10 == 0:    # print every 10 batches
                 print('[%d, %5d] loss: %.3f' %
@@ -336,7 +339,8 @@ if Perform_Train:
 
         if (epoch+1) % 5 == 0 and Perform_Test:
             # Make a prediction for the test cosmology every 5 epochs
-            tmp_Test_Pred = Test_CNN(net, Test_Shear, Test_Cosmols, batch_size)
+            #tmp_Test_Pred = Test_CNN(net, Test_Shear, Test_Cosmols, batch_size)
+            tmp_Test_Pred = TeCNN.Test_CNN()
             tmp_Test_Avg, tmp_Test_Err, _ = Avg_Pred(tmp_Test_Pred, Test_Cosmols.numpy() )
             np.save('%s/TestPredAvg_%s%s' %(Out_DIR,Arch_keyname,epoch+1), tmp_Test_Avg) 
                 
@@ -353,7 +357,9 @@ else:
 
 if Perform_Test:
     # NOW TEST THE PERFORMANCE OF THE CNN USING THE TEST SET
-    Test_Cosmols_Pred = Test_CNN(net, Test_Shear, Test_Cosmols, batch_size)
+    #Test_Cosmols_Pred = Test_CNN(net, Test_Shear, Test_Cosmols, batch_size)
+    TeCNN = Test_CNN_Class(net, Test_Shear, Test_Cosmols, batch_size)
+    Test_Cosmols_Pred = TeCNN.Test_CNN()
     # Compute an avg prediction per cosmology and corresponding error:
     Test_Cosmols_Pred_Avg, Test_Cosmols_Pred_Err, Test_Cosmols_Unique = Avg_Pred(Test_Cosmols_Pred, Test_Cosmols.numpy() )
     # Save output predictions:
@@ -428,51 +434,62 @@ if Run_Multifilters:
                                              Test_Cosmols_Pred_Avg.shape[1], len(multi_filters) ])
     Test_Cosmols_Pred_Err_Stack = np.zeros_like( Test_Cosmols_Pred_Avg_Stack )
     for i in range( len(multi_filters) ):
-        tmp_Arch_keyname = 'conv1F%sP%sS%s-conv2F%sP%sS%s_FC%sCosmol_run%s' %(multi_filters[i],conv1_padding,conv1_stride,
+        tmp_Arch_keyname = 'conv1F%sP%sS%s-conv2F%sP%sS%s_FC%sCosmol_Epochs%s' %(multi_filters[i],conv1_padding,conv1_stride,
                                                                               multi_filters[i],multi_padding[i],conv2_stride,
                                                                               num_pCosmol, RUN)
         Test_Cosmols_Pred_Avg_Stack[:,:,i] = np.load('%s/TestPredAvg_%s.npy' %(Out_DIR,tmp_Arch_keyname))
         Test_Cosmols_Pred_Err_Stack[:,:,i] = np.load('%s/TestPredErr_%s.npy' %(Out_DIR,tmp_Arch_keyname))
 
     multi_savename = '%s/Plot-Filter%s-%s_%s.png' %(Out_DIR, multi_filters[0], multi_filters[-1], Arch_keyname)
-    ylimits = [-40.,40.]
+    ylimit_acc = [[-40.,40.], [-40.,40.], [-40.,40.], [-40.,40.]]
     Plot_Accuracy_vs_Q(multi_filters,
                        Test_Cosmols_Pred_Avg_Stack,
                        Test_Cosmols_Pred_Err_Stack,
                        Test_Cosmols_Unique,
                        Test_mockIDs,
                        r'Filter size [pxl]',
-                       multi_savename, ylimits)
+                       multi_savename, ylimit_acc)
 
 
 Run_MultiEpochs = False
 if Run_MultiEpochs:
-    multi_epochs = [1,3,5,7,10,15] #,20,25,30,35,40]
+    #multi_epochs = [1,3,5,7,10,15] #,20,25,30,35,40]
+    multi_epochs = np.arange(5,1005,5)
     Test_Cosmols_Pred_Avg_Stack = np.zeros([ Test_Cosmols_Pred_Avg.shape[0],
                                              Test_Cosmols_Pred_Avg.shape[1], len(multi_epochs) ])
     Test_Cosmols_Pred_Err_Stack = np.zeros_like( Test_Cosmols_Pred_Avg_Stack )
     for i in range( len(multi_epochs) ):
         # read i data for various epochs
-        tmp_Arch_keyname = 'conv1F%sP%sS%s-conv2F%sP%sS%s_FC%sCosmol_run%s' %(conv1_filter,conv1_padding,conv1_stride,
+        tmp_Arch_keyname = 'conv1F%sP%sS%s-conv2F%sP%sS%s_FC%sCosmol_Epochs%s' %(conv1_filter,conv1_padding,conv1_stride,
                                                                               conv2_filter,conv2_padding,conv2_stride,
                                                                               num_pCosmol, multi_epochs[i])
         Test_Cosmols_Pred_Avg_Stack[:,:,i] = np.load('%s/TestPredAvg_%s.npy' %(Out_DIR,tmp_Arch_keyname))
-        Test_Cosmols_Pred_Err_Stack[:,:,i] = np.load('%s/TestPredErr_%s.npy' %(Out_DIR,tmp_Arch_keyname))
+        #Test_Cosmols_Pred_Err_Stack[:,:,i] = np.load('%s/TestPredErr_%s.npy' %(Out_DIR,tmp_Arch_keyname))
 
     # Renormalise the accuracies to be % differences from those obtained for the max num of epochs
     # need factor of Test_Cosmols_Unique into cancel factor in the Plot_Acc function.
     Test_Cosmols_Pred_Avg_Stack_Norm = np.copy(Test_Cosmols_Pred_Avg_Stack)
-    Test_Cosmols_Pred_Err_Stack_Norm = np.copy(Test_Cosmols_Pred_Avg_Stack)
+    Test_Cosmols_Pred_Err_Stack_Norm = np.copy(Test_Cosmols_Pred_Err_Stack)
     for i in range(Test_Cosmols_Pred_Avg_Stack.shape[2]):
         Test_Cosmols_Pred_Avg_Stack_Norm[:,:,i] = Test_Cosmols_Unique* Test_Cosmols_Pred_Avg_Stack[:,:,i] / Test_Cosmols_Pred_Avg_Stack[:,:,-1]
         Test_Cosmols_Pred_Err_Stack_Norm[:,:,i] = Test_Cosmols_Unique* Test_Cosmols_Pred_Err_Stack[:,:,i] / Test_Cosmols_Pred_Avg_Stack[:,:,-1]
 
     multi_savename = '%s/Plot-Epochs%s-%s_%s.png' %(Out_DIR, multi_epochs[0], multi_epochs[-1], Arch_keyname)
-    ylimits = [-10.,10.]
+    ylimit_acc = [[-5.,15.], [-5.,5.], [-10.,9.9], [-25.,19.9]]
     Plot_Accuracy_vs_Q(multi_epochs,
-                       Test_Cosmols_Pred_Avg_Stack_Norm,
-                       Test_Cosmols_Pred_Err_Stack_Norm,
+                       Test_Cosmols_Pred_Avg_Stack,
+                       Test_Cosmols_Pred_Err_Stack,
                        Test_Cosmols_Unique,
                        Test_mockIDs,
                        r'Number of epochs',
-                       multi_savename, ylimits)
+                       multi_savename, ylimit_acc)
+
+    ylimit_raw = [[0.2,0.5], [0.6,0.85], [0.64,0.79], [-1.7, -0.95]]
+    Plot_Pred_vs_Q(multi_epochs,
+                   Test_Cosmols_Pred_Avg_Stack,
+                   Test_Cosmols_Pred_Err_Stack,
+                   Test_Cosmols_Unique,
+                   Test_mockIDs,
+                   r'Number of epochs',
+                   multi_savename,
+                   ylimit_raw)
