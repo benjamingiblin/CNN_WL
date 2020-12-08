@@ -30,9 +30,9 @@ import sys                                        # Used to exit code w/o error 
 import os
 import random
 from scipy.ndimage import gaussian_filter as gauss
-from Classes_4_CNN import Linear_Net, Train_CNN_Class, Test_CNN_Class
+from Classes_4_CNN import Linear_Net, Res_Net, Train_CNN_Class, Test_CNN_Class
 from Functions_4_CNN import Slow_Read, Transform_Data, Untransform_Data, Calc_Output_Map_Size #, Train_CNN, Test_CNN, Transform_And_Train
-from Functions_4_CNN import Avg_Pred, Plot_Accuracy, Plot_Accuracy_vs_Q, Plot_Pred_vs_Q
+from Functions_4_CNN import Apply_Smoothing_To_Shear_Channels, Avg_Pred, Plot_Accuracy, Plot_Accuracy_vs_Q, Plot_Pred_vs_Q
 
 import torch          # main neural net module
 import torch.nn as nn
@@ -46,7 +46,8 @@ Perform_Test = True               # If True, runs the CNN on the test cosmologie
                                   # every 5 epochs in training, and at the end of training.
                                   # If False it reads in the pre-saved results
 
-Net_Type = "Linear" # If Linear, then conv layers are applied sequentially (no residual layers).
+Net_Type = "Residual" # If Linear, then conv layers are applied sequentially (no residual layers).
+                      # If Residual, then maps pass through residual blocks (conv+actv+conv)
 
 mock_Type = "KV450" #"KV450" #"KiDS1000"
 if mock_Type == "KV450":
@@ -54,10 +55,8 @@ if mock_Type == "KV450":
 elif mock_Type== "KiDS1000":
     Realisations = 10
 
-Data_Type = "Shear"           # Ultimately may use kappa maps as well
-                              # in which case this variable will change.
-                              # !!! Note, still need to code in this functionality !!!
-                            
+Data_Type = "Kappa"           # "Shear", "Kappa" or "ShearKappa"
+                                                          
 ZBlabel = ['ZBcut0.1-0.3', 'ZBcut0.3-0.5', 'ZBcut0.5-0.7', 'ZBcut0.7-0.9', 'ZBcut0.9-1.2']
           #['ZBcut0.1-1.2']   # The redshift range imposed on the maps
 neff =    [0.62, 1.18, 1.85, 1.26, 1.31]        # The num of gals per arcmin^2 in each redshift bin
@@ -155,26 +154,26 @@ Read_DIR = 'QuickReadData/%s' %Data_keyname
 if Fast_Or_Slow_Read == "Slow":
     print("Performing a slow read of the input data!")
     # Slow read of data takes ~140s PER z-bin on cuillin head node
-    Shear,Train_Shear,Test_Shear, Cosmols,Train_Cosmols,Test_Cosmols, Cosmols_IDs,Train_Cosmols_IDs,Test_Cosmols_IDs = Slow_Read(CS_DIR, mock_Type,Cosmols_Raw,mockIDs,Train_mockIDs,Test_mockIDs,Realisations,ZBlabel,Res,Test_Realisation_num,Noise,False)
+    Data,Train_Data,Test_Data, Cosmols,Train_Cosmols,Test_Cosmols, Cosmols_IDs,Train_Cosmols_IDs,Test_Cosmols_IDs = Slow_Read(CS_DIR, Data_Type,mock_Type,Cosmols_Raw,mockIDs,Train_mockIDs,Test_mockIDs,Realisations,ZBlabel,Res,Test_Realisation_num,Noise_Data,False)
                                                                                                                           
     # Pickle the train/test data to make reading faster next time
     if not os.path.exists(Read_DIR):
         os.makedirs(Read_DIR)
     # Save shear
-    np.save('%s/Shear' %Read_DIR, Shear )
-    np.save('%s/Train_Shear' %Read_DIR, Train_Shear )
-    np.save('%s/Test_Shear'  %Read_DIR, Test_Shear )
+    np.save('%s/Data' %Read_DIR, Data )
+    np.save('%s/Train_Data' %Read_DIR, Train_Data )
+    np.save('%s/Test_Data'  %Read_DIR, Test_Data )
     # Save cosmols
     np.save('%s/Cosmol_numPCosmol%s' %(Read_DIR, num_pCosmol), Cosmols )
     np.save('%s/Train_Cosmol_numPCosmol%s' %(Read_DIR,num_pCosmol), Train_Cosmols )
     np.save('%s/Test_Cosmol_numPCosmol%s' %(Read_DIR, num_pCosmol), Test_Cosmols )
     # Save cosmol IDs
     np.savetxt('%s/Cosmol_IDs.txt' %Read_DIR,
-               Cosmols_IDs, header='Cosmol ID for map in Shear set', fmt='%s')
+               Cosmols_IDs, header='Cosmol ID for map in Overall data set', fmt='%s')
     np.savetxt('%s/Train_Cosmol_IDs.txt' %Read_DIR,
-               Train_Cosmols_IDs, header='Cosmol ID for map Train_Shear set', fmt='%s')
+               Train_Cosmols_IDs, header='Cosmol ID for map Train_Data set', fmt='%s')
     np.savetxt('%s/Test_Cosmol_IDs.txt' %Read_DIR,
-               Test_Cosmols_IDs, header='Cosmol ID for map in Test_Shear set', fmt='%s')
+               Test_Cosmols_IDs, header='Cosmol ID for map in Test_Data set', fmt='%s')
     
 elif Fast_Or_Slow_Read == "Fast":
     # For shear only, takes 47s for 5 bins & Augment_Data=False,
@@ -182,9 +181,9 @@ elif Fast_Or_Slow_Read == "Fast":
     print("Performing a quick read of the input data.")
     t1 = time.time()
     # Read pickled shear
-    Shear = np.load('%s/Shear.npy' %Read_DIR)
-    Train_Shear = np.load('%s/Train_Shear.npy' %Read_DIR)
-    Test_Shear = np.load('%s/Test_Shear.npy'  %Read_DIR)
+    Data = np.load('%s/Data.npy' %Read_DIR)
+    Train_Data = np.load('%s/Train_Data.npy' %Read_DIR)
+    Test_Data = np.load('%s/Test_Data.npy'  %Read_DIR)
     # Read pickled Cosmols
     Cosmols = np.load('%s/Cosmol_numPCosmol%s.npy' %(Read_DIR, num_pCosmol))
     Train_Cosmols = np.load('%s/Train_Cosmol_numPCosmol%s.npy' %(Read_DIR,num_pCosmol))
@@ -196,29 +195,29 @@ elif Fast_Or_Slow_Read == "Fast":
     t2 = time.time()
     print("Quick read of data took %.0f s for %s redshift bins." %((t2-t1),len(ZBlabel)) )
 
-    
+
 if Fast_Or_Slow_Read != "None":
     # Then it means the data was read in, proceed to transform it:
     # Apply Gaussian smoothing of maps
     sigma_pxl=1 # smoothing scale in units of pxl
-    Shear = gauss(Shear, sigma=[0,0,sigma_pxl,sigma_pxl])
-    Train_Shear = gauss(Train_Shear, sigma=[0,0,sigma_pxl,sigma_pxl])
-    Test_Shear = gauss(Test_Shear, sigma=[0,0,sigma_pxl,sigma_pxl])
-
-    input_channel = Train_Shear.shape[1]
+    Data = Apply_Smoothing_To_Shear_Channels(Data_Type, Data, sigma_pxl)
+    Train_Data = Apply_Smoothing_To_Shear_Channels(Data_Type, Train_Data, sigma_pxl)
+    Test_Data = Apply_Smoothing_To_Shear_Channels(Data_Type, Test_Data, sigma_pxl)
+    
+    input_channel = Train_Data.shape[1]
     # A mean and stan-dev for each channel - used to normalise data
     Mean_T = np.zeros(input_channel)
     Std_T = np.zeros(input_channel)
     for i in range(input_channel):
-        Mean_T[i] = np.mean( Train_Shear[:,i,:,:] )
-        Std_T[i] = np.std( Train_Shear[:,i,:,:] )
+        Mean_T[i] = np.mean( Train_Data[:,i,:,:] )
+        Std_T[i] = np.std( Train_Data[:,i,:,:] )
 
     # Convert inputs to torch tensors
     Train_Cosmols = torch.from_numpy( Train_Cosmols ) 
     Test_Cosmols = torch.from_numpy( Test_Cosmols )
 
-    Train_Shear = torch.from_numpy( Transform_Data(Train_Shear, Mean_T, Std_T) ).double()
-    Test_Shear = torch.from_numpy( Transform_Data(Test_Shear, Mean_T, Std_T) ).double()
+    Train_Data = torch.from_numpy( Transform_Data(Train_Data, Mean_T, Std_T) ).double()
+    Test_Data = torch.from_numpy( Transform_Data(Test_Data, Mean_T, Std_T) ).double()
     
     # Save the mean & stdev so the KiDS-1000 data can be transformed in the same way:
     np.savetxt('%s/Channel_Mean_Stdev.txt' %Read_DIR, np.c_[Mean_T, Std_T], header='# channel mean, sigma')
@@ -250,15 +249,22 @@ output_channel = 128
 # Set up the CNN architecture:
 if Net_Type == "Linear":
     net = Linear_Net(input_channel, output_channel,
-          conv1_filter,conv1_padding,conv1_stride,
-          conv2_filter,conv2_padding,conv2_stride,
-          act1_map_size,num_pCosmol,
-          nclayers, pool_layers)
+                     conv1_filter,conv1_padding,conv1_stride,
+                     conv2_filter,conv2_padding,conv2_stride,
+                     act1_map_size,num_pCosmol,
+                     nclayers, pool_layers)
+
+elif Net_Type == "Residual":
+    net = Res_Net(input_channel, output_channel,
+                  conv1_filter,conv1_padding,conv1_stride,
+                  conv2_filter,conv2_padding,conv2_stride,
+                  act1_map_size,num_pCosmol,
+                  nclayers, pool_layers)
     
 net.to(device).float()
 # Lines to test dimensionality of output from the CNN:
-#output = net(Train_Shear[0:5,:].to(device).float())
-#print("Input shape is ", Train_Shear.shape)
+#output = net(Train_Data[0:5,:].to(device).float())
+#print("Input shape is ", Train_Data.shape)
 #print("Output shape is ", output.shape) 
 
 
@@ -300,7 +306,7 @@ if Perform_Train:
     criterion = nn.MSELoss()
     optimizer = optim.Adam(net.parameters(), lr=lr)
     TrCNN = Train_CNN_Class(net, criterion, optimizer) 
-    TeCNN = Test_CNN_Class(net, Test_Shear, Test_Cosmols, batch_size)
+    TeCNN = Test_CNN_Class(net, Test_Data, Test_Cosmols, batch_size)
     
     t1 = time.time()
     for epoch in range(Epochs_Tot):
@@ -309,13 +315,13 @@ if Perform_Train:
         # Feed the training set maps to the neural net in batches of
         # at a time. Therefore, create a randomised array of indicies
         # (0-->999) in sets of 5.
-        rand_idx = np.arange(0,Train_Shear.shape[0])
+        rand_idx = np.arange(0,Train_Data.shape[0])
         np.random.seed(1) # Seed the randomisation, so it's reproducible
         random.shuffle( rand_idx )
         rand_idx = np.reshape( rand_idx, ( int(len(rand_idx)/batch_size), batch_size) )
 
         for i in range( rand_idx.shape[0] ):
-            inputs = Train_Shear[ rand_idx[i] ].to(device)
+            inputs = Train_Data[ rand_idx[i] ].to(device)
             labels = Train_Cosmols[ rand_idx[i] ].to(device)
             
             # Loop through shape noise realisations (does only one noiseless loop if Noise_Cycle is False):
@@ -339,11 +345,10 @@ if Perform_Train:
 
         if (epoch+1) % 5 == 0 and Perform_Test:
             # Make a prediction for the test cosmology every 5 epochs
-            #tmp_Test_Pred = Test_CNN(net, Test_Shear, Test_Cosmols, batch_size)
+            #tmp_Test_Pred = Test_CNN(net, Test_Data, Test_Cosmols, batch_size)
             tmp_Test_Pred = TeCNN.Test_CNN()
             tmp_Test_Avg, tmp_Test_Err, _ = Avg_Pred(tmp_Test_Pred, Test_Cosmols.numpy() )
             np.save('%s/TestPredAvg_%s%s' %(Out_DIR,Arch_keyname,epoch+1), tmp_Test_Avg) 
-                
                 
     t2 = time.time()
     print('Finished Training. Took %.1f seconds.' %(t2-t1))
@@ -357,8 +362,8 @@ else:
 
 if Perform_Test:
     # NOW TEST THE PERFORMANCE OF THE CNN USING THE TEST SET
-    #Test_Cosmols_Pred = Test_CNN(net, Test_Shear, Test_Cosmols, batch_size)
-    TeCNN = Test_CNN_Class(net, Test_Shear, Test_Cosmols, batch_size)
+    #Test_Cosmols_Pred = Test_CNN(net, Test_Data, Test_Cosmols, batch_size)
+    TeCNN = Test_CNN_Class(net, Test_Data, Test_Cosmols, batch_size)
     Test_Cosmols_Pred = TeCNN.Test_CNN()
     # Compute an avg prediction per cosmology and corresponding error:
     Test_Cosmols_Pred_Avg, Test_Cosmols_Pred_Err, Test_Cosmols_Unique = Avg_Pred(Test_Cosmols_Pred, Test_Cosmols.numpy() )

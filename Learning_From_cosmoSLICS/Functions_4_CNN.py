@@ -27,6 +27,7 @@ from astropy.io import fits                       # For reading FITS files
 import time                                       # Used to time parts of the code.
 import sys                                        # Used to exit code without error, and read in inputs from command line    
 
+from scipy.ndimage import gaussian_filter as gauss
 import matplotlib.gridspec as gridspec
 from matplotlib import rcParams
 import matplotlib.pyplot as plt
@@ -43,8 +44,18 @@ import torch
 # find GPU device if available, else use CPU
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-def Slow_Read(CS_DIR, mock_Type, Cosmols_Raw, mockIDs, Train_mockIDs, Test_mockIDs,
+def Slow_Read(CS_DIR, Data_Type,mock_Type, Cosmols_Raw, mockIDs, Train_mockIDs, Test_mockIDs,
               Realisations, ZBlabel, Res, Test_Realisation_num, Noise, Augment):
+
+    # What sort of data to read in:
+    if Data_Type == "Shear":
+        n_type_map = 2 # number of types of map (2 for shear1/2)
+    elif Data_Type == "Kappa":
+        n_type_map = 1 # 1 for kappa
+    elif Data_Type == "ShearKappa":
+        n_type_map = 3 # 3 for both.
+        
+    
     if Augment:
         # Reading in 3 rotations & 2 reflections of every map (6x larger training sample)
         aug_f=6
@@ -65,7 +76,7 @@ def Slow_Read(CS_DIR, mock_Type, Cosmols_Raw, mockIDs, Train_mockIDs, Test_mockI
             SN = [0.28]
 
     # Start preparing the arrays to store the shear maps & corresponding cosmological parameters:
-    Shear = np.zeros([ len(mockIDs)*2*Realisations*4*aug_f, 2*len(ZBlabel), Res,Res ])
+    Data = np.zeros([ len(mockIDs)*2*Realisations*4*aug_f, n_type_map*len(ZBlabel), Res,Res ])
                                                               # This has the dimensions of 
                                                               # [num_maps, num_channels, pxl, pxl ]
                                                               # Here num_maps=26(cosmols)*2(seeds)*50(realisations)
@@ -73,14 +84,14 @@ def Slow_Read(CS_DIR, mock_Type, Cosmols_Raw, mockIDs, Train_mockIDs, Test_mockI
                                                               # And num_channels (previously 3 for colours) is
                                                               # 2 for shear components * number of z-bins.
 
-    Test_Shear = np.zeros([ len(Test_mockIDs)*2*Test_Realisation_num*4*aug_f, 2*len(ZBlabel), Res,Res ])
-    Train_Shear = np.zeros([ ( len(Test_mockIDs)*(Realisations-Test_Realisation_num) + len(Train_mockIDs)*Realisations)*2*4*aug_f,
-                         2*len(ZBlabel), Res,Res ])
+    Test_Data = np.zeros([ len(Test_mockIDs)*2*Test_Realisation_num*4*aug_f, n_type_map*len(ZBlabel), Res,Res ])
+    Train_Data = np.zeros([ ( len(Test_mockIDs)*(Realisations-Test_Realisation_num) + len(Train_mockIDs)*Realisations)*2*4*aug_f,
+                         n_type_map*len(ZBlabel), Res,Res ])
 
     # Create arrays that will match the cosmol params to the shear images
-    Cosmols = np.zeros([ Shear.shape[0], 4 ])              # store all cosmols
-    Test_Cosmols = np.zeros([ Test_Shear.shape[0], 4 ])    # store the test cosmols
-    Train_Cosmols = np.zeros([ Train_Shear.shape[0], 4 ])  # & the training cosmols
+    Cosmols = np.zeros([ Data.shape[0], 4 ])              # store all cosmols
+    Test_Cosmols = np.zeros([ Test_Data.shape[0], 4 ])    # store the test cosmols
+    Train_Cosmols = np.zeros([ Train_Data.shape[0], 4 ])  # & the training cosmols
     # These arrays aren't used in the code. They're just for easily checking
     # the mockID that each row of the Shear arrays correspond to:
     Cosmols_IDs = []
@@ -107,23 +118,36 @@ def Slow_Read(CS_DIR, mock_Type, Cosmols_Raw, mockIDs, Train_mockIDs, Test_mockI
                         channel_count_train = 0
             
                         for zb in range(len(ZBlabel)):              # scroll through z-bins
-                            for s in range(2):                      # Scroll through 2 shear components
+                            for s in range(n_type_map):             # Scroll through types of map (2shear, 1kappa)
 
-                                # Open the map
-                                f = fits.open(CS_DIR+'%s_%s/%s/Shear_Maps/Res%sx%s/%s/Shear%s_LOS%s_SN%s_Quad%s%s.fits'
+                                if Data_Type == "Shear":
+                                    # Open a shear map
+                                    f = fits.open(CS_DIR+'%s_%s/%s/Shear_Maps/Res%sx%s/%s/Shear%s_LOS%s_SN%s_Quad%s%s.fits'
                                     %(mockIDs[i],seed,mock_Type,Res,Res,ZBlabel[zb],s+1,r+1,SN[zb],q,ac))
-                        
-                                Shear[map_count,channel_count,:,:] = f[0].data # store shear
+                                elif Data_Type == "Kappa":
+                                    # Open a kappa map
+                                    f = fits.open(CS_DIR+'%s_%s/%s/Kappa_Maps/Res%sx%s/%s/Kappa_LOS%s_SN%s_SS2.3arcmin_Quad%s%s.fits' %(mockIDs[i],seed,mock_Type,Res,Res,ZBlabel[zb],r+1,SN[zb],q,ac))
+                                    
+                                elif Data_Type == "ShearKappa":
+                                    # Read in shear if s=0,1 & kappa if s=0
+                                    if s==0 or s==1:
+                                        f = fits.open(CS_DIR+'%s_%s/%s/Shear_Maps/Res%sx%s/%s/Shear%s_LOS%s_SN%s_Quad%s%s.fits' %(mockIDs[i],seed,mock_Type,Res,Res,ZBlabel[zb],s+1,r+1,SN[zb],q,ac))
+                                    elif s==2:
+                                        f = fits.open(CS_DIR+'%s_%s/%s/Kappa_Maps/Res%sx%s/%s/Kappa_LOS%s_SN%s_SS2.3arcmin_Quad%s%s.fits' %(mockIDs[i],seed,mock_Type,Res,Res,ZBlabel[zb],r+1,SN[zb],q,ac))
+
+    
+                                    
+                                Data[map_count,channel_count,:,:] = f[0].data # store data
                                 Cosmols[map_count,:] = Cosmols_Raw[i,:]        # and corresponding cosmols
                                 Cosmols_IDs.append( mockIDs[i] )               # and the ID tag
                                 
                                 # Decide if this mockID & realisation corresponds to Test or Train:
                                 if (mockIDs[i] in Test_mockIDs) and r<Test_Realisation_num:
                                     # Store it in the test set
-                                    Test_Shear[map_count_test,channel_count_test, :, :] = f[0].data
+                                    Test_Data[map_count_test,channel_count_test, :, :] = f[0].data
                                     Test_Cosmols[map_count_test,:] = Cosmols_Raw[i,:]
                                     channel_count_test+=1
-                                    if channel_count_test == len(ZBlabel)*2:
+                                    if channel_count_test == len(ZBlabel)*n_type_map:
                                         # We have finished reading in all channels, so also increment the map number:
                                         map_count_test+=1
                                         # and store the Test_Cosmol_ID 
@@ -131,10 +155,10 @@ def Slow_Read(CS_DIR, mock_Type, Cosmols_Raw, mockIDs, Train_mockIDs, Test_mockI
                                 
                                 else:
                                     # store it in the training set
-                                    Train_Shear[map_count_train,channel_count_train, :, :] = f[0].data
+                                    Train_Data[map_count_train,channel_count_train, :, :] = f[0].data
                                     Train_Cosmols[map_count_train,:] = Cosmols_Raw[i,:]
                                     channel_count_train+=1
-                                    if channel_count_train == len(ZBlabel)*2:
+                                    if channel_count_train == len(ZBlabel)*n_type_map:
                                         # We have finished reading in all channels, so also increment the map number:
                                         map_count_train+=1
                                         # and store the Test_Cosmol_ID
@@ -146,8 +170,23 @@ def Slow_Read(CS_DIR, mock_Type, Cosmols_Raw, mockIDs, Train_mockIDs, Test_mockI
     t2 = time.time()                                       # Take another timer measurement
     print("Time taken to read in maps is %.1f seconds." %(t2-t1))
 
-    return Shear, Train_Shear, Test_Shear, Cosmols, Train_Cosmols, Test_Cosmols, Cosmols_IDs, Train_Cosmols_IDs, Test_Cosmols_IDs
+    return Data, Train_Data, Test_Data, Cosmols, Train_Cosmols, Test_Cosmols, Cosmols_IDs, Train_Cosmols_IDs, Test_Cosmols_IDs
 
+def Apply_Smoothing_To_Shear_Channels(Data_Type, Data, sigma_pxl):
+    # read in Data_Type to determine if Data is composed of shear only
+    # or shear+kappa. Only going to apply smoothing to shear.
+    
+    if Data_Type=="Shear":
+        Data = gauss(Data, sigma=[0,0,sigma_pxl,sigma_pxl])
+        
+    elif Data_Type=="ShearKappa":
+        # Omit every 3rd map from smoothing (it's a kappa map, pre-smoothed in mass recon).
+        for j in range( Data.shape[1] ):
+            if (j+1)%3 != 0:
+                Data[:,j,:,:] = gauss(Data[:,j,:,:], sigma=[0,sigma_pxl,sigma_pxl])
+
+    return Data
+        
 
 def Transform_Data(data, mean, std):
     new_data = np.zeros_like( data)

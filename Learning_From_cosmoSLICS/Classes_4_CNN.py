@@ -71,6 +71,60 @@ class Linear_Net(nn.Module):
         return x
 
 
+    
+class Res_Net(nn.Module):
+    # Basically the same as the Linear_Net class, except with a different forward function
+    # here, the maps pass through "residual blocks", each consisting of conv+actv+conv
+    # before the output is added to the input. For this addition to be possible, the
+    # conv's involved in the residual blocks must have sufficient padding so as to not change
+    # the size of the maps.
+    # The number of residual blocks is controlled by the nclayers argument, just like in Linear_Net.
+
+    def __init__(self, input_channel, output_channel,
+                         conv1_filter,conv1_padding,conv1_stride,
+                         conv2_filter,conv2_padding,conv2_stride,
+                         act1_map_size,num_pCosmol,
+                         nclayers, pool_layers):
+        super(Res_Net, self).__init__()
+
+        self.input_channel = input_channel
+        self.output_channel = output_channel
+        self.conv1_filter = conv1_filter
+        self.conv1_padding = conv1_padding
+        self.conv1_stride = conv1_stride
+        self.conv2_filter = conv2_filter
+        self.conv2_padding = conv2_padding
+        self.conv2_stride = conv2_stride
+        self.act1_map_size = act1_map_size
+        self.num_pCosmol = num_pCosmol
+        self.nclayers = nclayers
+        self.pool_layers = pool_layers
+
+        self.pool = nn.MaxPool2d(2, 2)
+        # Defines the first convolution:
+        self.conv1 = nn.Conv2d(self.input_channel, self.output_channel, self.conv1_filter,
+                               padding=self.conv1_padding, stride=self.conv1_stride)
+        self.conv2 = nn.Conv2d(self.output_channel, self.output_channel, self.conv2_filter,
+                               padding=self.conv2_padding, stride=self.conv2_stride)
+        self.fc1 = nn.Linear(self.output_channel*self.act1_map_size*self.act1_map_size, self.num_pCosmol)
+        
+
+    # ...and this function executes the CNN
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        # Put the output map through residual block as many times as nlayers dictates.
+        for nl in range(self.nclayers-1):
+            y = self.conv2( F.relu(self.conv2(x)) ) # apply residual block 
+            x = F.relu( x+y )                       # add output to input & act
+            
+            if nl in self.pool_layers-2:            # apply pooling after specified res-blocks.
+                x = self.pool(x)
+        x = x.view(-1, x.shape[1]*x.shape[2]*x.shape[3])      # Last 3 numbers are output dims of previous conv.
+        x = self.fc1(x)
+        return x
+
+
+    
 class Train_CNN_Class:
 
     def __init__(self, net, criterion, optimizer):
@@ -129,7 +183,7 @@ class Test_CNN_Class:
             labels = self.Test_Labels[ self.rand_idx_test[i] ].to(device)
             outputs = self.net(inputs.float())
             # Store the output predictions
-            Test_Pred[i*self.batch_size:(i+1)*self.batch_size, :] = outputs.detach().cpu().numpy()
-        return Test_Pred
+            self.Test_Pred[i*self.batch_size:(i+1)*self.batch_size, :] = outputs.detach().cpu().numpy()
+        return self.Test_Pred
 
     
