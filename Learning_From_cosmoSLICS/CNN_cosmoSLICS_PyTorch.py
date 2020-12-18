@@ -40,13 +40,13 @@ import torch.nn.functional as F
 # find GPU device if available, else use CPU
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-Perform_Train = True              # If True it will train the CNN (obviously)
-                                  # If False it will read a pre-saved CNN
-Perform_Test = True               # If True, runs the CNN on the test cosmologies
-                                  # every 5 epochs in training, and at the end of training.
-                                  # If False it reads in the pre-saved results
+Perform_Train = True               # If True it will train the CNN (obviously)
+                                   # If False it will read a pre-saved CNN
+Perform_Test = True                # If True, runs the CNN on the test cosmologies
+                                   # every 5 epochs in training, and at the end of training.
+                                   # If False it reads in the pre-saved results
 
-Net_Type = "Residual" # If Linear, then conv layers are applied sequentially (no residual layers).
+Net_Type = "Linear" # If Linear, then conv layers are applied sequentially (no residual layers).
                       # If Residual, then maps pass through residual blocks (conv+actv+conv)
 
 mock_Type = "KV450" #"KV450" #"KiDS1000"
@@ -55,7 +55,7 @@ if mock_Type == "KV450":
 elif mock_Type== "KiDS1000":
     Realisations = 10
 
-Data_Type = "Kappa"           # "Shear", "Kappa" or "ShearKappa"
+Data_Type = "ShearKappa"           # "Shear", "Kappa" or "ShearKappa"
                                                           
 ZBlabel = ['ZBcut0.1-0.3', 'ZBcut0.3-0.5', 'ZBcut0.5-0.7', 'ZBcut0.7-0.9', 'ZBcut0.9-1.2']
           #['ZBcut0.1-1.2']   # The redshift range imposed on the maps
@@ -95,17 +95,18 @@ nclayers = int(sys.argv[1])   # The number of conv. layers to have in the CNN
 conv1_filter = int(sys.argv[2]) 
                               
 print("Setting up a CNN with %s conv layers." %nclayers)
-                              
-Epochs_Tot = int(sys.argv[3]) # Variable for checking convergence of CNN predictions
-                              # run the CNN several times changing only this variable
-                              # and compare output to verify convergence.
 
-Fast_Or_Slow_Read = "Fast"    # if "Slow", reads all shear maps one-by-one into array
+Epochs_Start = int(sys.argv[3]) # If zero, starts a CNN from fresh.
+                                # If>0, reads in a pre-trained CNN & starts training that.
+Epochs_End = int(sys.argv[4])   # where to stop training.
+Epochs_Tot = Epochs_End - Epochs_Start
+
+Fast_Or_Slow_Read = "Slow"    # if "Slow", reads all shear maps one-by-one into array
                               # (always run "Slow" first time).
                               # If "Fast", reads a pickled version of the data
                               
                            
-Split_Type = "Fid"            # "Fid" meaning fiducial, means the 6 cosmols closest to the middle
+Split_Type = "TestAll"            # "Fid" meaning fiducial, means the 6 cosmols closest to the middle
                               # of the parameter space are the test cosmologies, with the first 12
                               # LOS per seed being test maps, with the final 13 per seed being training maps.
                            
@@ -114,13 +115,21 @@ if Split_Type == "Fid":
     Test_Realisation_num = int(Realisations/2)  # Use this many of the lines of sight in Test set
                               # So the other (Realisations-Test_Realisation_num) will be in the training set
                               
+elif Split_Type == "TestAll":
+    # Put a few realisations from ALL cosmologies in the Test set.
+    Test_mockIDs = []
+    for i in range(25):
+        Test_mockIDs.append('%.2d' %i)
+    Test_mockIDs.append('fid')
+    Test_Realisation_num = 5
+    
 elif Split_Type == "None":
     # Then there is no splitting of the train & test sets, everything is put in the training set.
     Test_mockIDs = []
     Test_Realisation_num = 0
 
 else:
-    print("The only Split_Type's currently supported are: Fid, None. Please set accordingly. EXITING.")
+    print("The only Split_Type's currently supported are: Fid, TestAll, None. Please set accordingly. EXITING.")
     sys.exit()
 
                               
@@ -195,7 +204,7 @@ elif Fast_Or_Slow_Read == "Fast":
     t2 = time.time()
     print("Quick read of data took %.0f s for %s redshift bins." %((t2-t1),len(ZBlabel)) )
 
-
+    
 if Fast_Or_Slow_Read != "None":
     # Then it means the data was read in, proceed to transform it:
     # Apply Gaussian smoothing of maps
@@ -223,9 +232,14 @@ if Fast_Or_Slow_Read != "None":
     np.savetxt('%s/Channel_Mean_Stdev.txt' %Read_DIR, np.c_[Mean_T, Std_T], header='# channel mean, sigma')
     
 else:
-    input_channel = 10  # dummy number, defined only so the NN can be defined below,
-                        # although we're not running the CNN if Fast_Or_Slow_Read is "None"
-                        # (no data read in).
+    # need to define the input channel to define the neural network
+    # and read in a pre-saved one. This depends on the Data_Type.    
+    if Data_Type == "Kappa":
+        input_channel = 1*len(ZBlabel)
+    elif Data_Type == "Shear":
+        input_channel =	2*len(ZBlabel)
+    elif Data_Type == "ShearKappa":
+        input_channel = 3*len(ZBlabel)
 
 # Define the padding, stride & filter sizes to be used in the CNN layers
 conv1_padding=0                # padding applied on 1st conv layer
@@ -260,8 +274,9 @@ elif Net_Type == "Residual":
                   conv2_filter,conv2_padding,conv2_stride,
                   act1_map_size,num_pCosmol,
                   nclayers, pool_layers)
-    
+
 net.to(device).float()
+
 # Lines to test dimensionality of output from the CNN:
 #output = net(Train_Data[0:5,:].to(device).float())
 #print("Input shape is ", Train_Data.shape)
@@ -297,7 +312,13 @@ if not os.path.exists(Out_DIR):
 Arch_keyname = 'conv1F%sP%sS%s-conv2F%sP%sS%s_FC%sCosmol_Epochs' %(conv1_filter,conv1_padding,conv1_stride,
                                                                   conv2_filter,conv2_padding,conv2_stride,
                                                                   num_pCosmol)
-    
+if Epochs_Start>0:
+    # Read in a pre-trained CNN to either continue training or make predictions with.
+    print('Pre-reading CNN: %s/Net_%s%s.pth' %(Out_DIR,Arch_keyname,Epochs_Start))
+    net.load_state_dict( torch.load('%s/Net_%s%s.pth' %(Out_DIR,Arch_keyname,Epochs_Start), map_location=device) )
+    net.to(device).float()
+
+
 # Whether training or just testing, feed the shear maps to the CNN in batches of size:
 batch_size = 4
 
@@ -309,7 +330,7 @@ if Perform_Train:
     TeCNN = Test_CNN_Class(net, Test_Data, Test_Cosmols, batch_size)
     
     t1 = time.time()
-    for epoch in range(Epochs_Tot):
+    for epoch in range(Epochs_Start, Epochs_End):
         running_loss = 0.0  # value of the loss that gets updated as it trains
     
         # Feed the training set maps to the neural net in batches of
@@ -343,7 +364,7 @@ if Perform_Train:
                 running_loss = 0.0
 
 
-        if (epoch+1) % 5 == 0 and Perform_Test:
+        if (epoch+1) % 20 == 0 and Perform_Test:
             # Make a prediction for the test cosmology every 5 epochs
             #tmp_Test_Pred = Test_CNN(net, Test_Data, Test_Cosmols, batch_size)
             tmp_Test_Pred = TeCNN.Test_CNN()
@@ -353,11 +374,11 @@ if Perform_Train:
     t2 = time.time()
     print('Finished Training. Took %.1f seconds.' %(t2-t1))
     # Save the CNN
-    torch.save(net.state_dict(), '%s/Net_%s%s.pth' %(Out_DIR,Arch_keyname,Epochs_Tot))
+    torch.save(net.state_dict(), '%s/Net_%s%s.pth' %(Out_DIR,Arch_keyname,Epochs_End))
 
 else:
     # Don't train, load a pre-trained CNN
-    net.load_state_dict( torch.load('%s/Net_%s%s.pth' %(Out_DIR,Arch_keyname,Epochs_Tot), map_location=device) )
+    net.load_state_dict( torch.load('%s/Net_%s%s.pth' %(Out_DIR,Arch_keyname,Epochs_End), map_location=device) )
 
 
 if Perform_Test:
@@ -368,14 +389,14 @@ if Perform_Test:
     # Compute an avg prediction per cosmology and corresponding error:
     Test_Cosmols_Pred_Avg, Test_Cosmols_Pred_Err, Test_Cosmols_Unique = Avg_Pred(Test_Cosmols_Pred, Test_Cosmols.numpy() )
     # Save output predictions:
-    np.save('%s/TestPredAvg_%s%s' %(Out_DIR,Arch_keyname,Epochs_Tot), Test_Cosmols_Pred_Avg)
-    np.save('%s/TestPredErr_%s%s' %(Out_DIR,Arch_keyname,Epochs_Tot), Test_Cosmols_Pred_Err)
+    np.save('%s/TestPredAvg_%s%s' %(Out_DIR,Arch_keyname,Epochs_End), Test_Cosmols_Pred_Avg)
+    np.save('%s/TestPredErr_%s%s' %(Out_DIR,Arch_keyname,Epochs_End), Test_Cosmols_Pred_Err)
     np.save('%s/TestTrue'%Out_DIR, Test_Cosmols_Unique )
 
 else:
     # Load the pre-saved test results
-    Test_Cosmols_Pred_Avg = np.load('%s/TestPredAvg_%s%s.npy' %(Out_DIR,Arch_keyname,Epochs_Tot))
-    Test_Cosmols_Pred_Err = np.load('%s/TestPredErr_%s%s.npy' %(Out_DIR,Arch_keyname,Epochs_Tot))
+    Test_Cosmols_Pred_Avg = np.load('%s/TestPredAvg_%s%s.npy' %(Out_DIR,Arch_keyname,Epochs_End))
+    Test_Cosmols_Pred_Err = np.load('%s/TestPredErr_%s%s.npy' %(Out_DIR,Arch_keyname,Epochs_End))
     Test_Cosmols_Unique   = np.load('%s/TestTrue.npy'%Out_DIR)
 
 
@@ -441,7 +462,7 @@ if Run_Multifilters:
     for i in range( len(multi_filters) ):
         tmp_Arch_keyname = 'conv1F%sP%sS%s-conv2F%sP%sS%s_FC%sCosmol_Epochs%s' %(multi_filters[i],conv1_padding,conv1_stride,
                                                                               multi_filters[i],multi_padding[i],conv2_stride,
-                                                                              num_pCosmol, RUN)
+                                                                              num_pCosmol, Epochs_Tot )
         Test_Cosmols_Pred_Avg_Stack[:,:,i] = np.load('%s/TestPredAvg_%s.npy' %(Out_DIR,tmp_Arch_keyname))
         Test_Cosmols_Pred_Err_Stack[:,:,i] = np.load('%s/TestPredErr_%s.npy' %(Out_DIR,tmp_Arch_keyname))
 
@@ -458,8 +479,10 @@ if Run_Multifilters:
 
 Run_MultiEpochs = False
 if Run_MultiEpochs:
-    #multi_epochs = [1,3,5,7,10,15] #,20,25,30,35,40]
     multi_epochs = np.arange(5,1005,5)
+    # accidentally overwrote the 500 epoch training sample for ShearKappa 6 layer linear, remove from list:
+    #multi_epochs = np.delete(multi_epochs, np.where(multi_epochs==500)[0])
+    
     Test_Cosmols_Pred_Avg_Stack = np.zeros([ Test_Cosmols_Pred_Avg.shape[0],
                                              Test_Cosmols_Pred_Avg.shape[1], len(multi_epochs) ])
     Test_Cosmols_Pred_Err_Stack = np.zeros_like( Test_Cosmols_Pred_Avg_Stack )
@@ -489,7 +512,7 @@ if Run_MultiEpochs:
                        r'Number of epochs',
                        multi_savename, ylimit_acc)
 
-    ylimit_raw = [[0.2,0.5], [0.6,0.85], [0.64,0.79], [-1.7, -0.95]]
+    ylimit_raw = [[0.2,0.5], [0.6,0.85], [0.64,0.79], [-1.9, -0.95]]
     Plot_Pred_vs_Q(multi_epochs,
                    Test_Cosmols_Pred_Avg_Stack,
                    Test_Cosmols_Pred_Err_Stack,

@@ -51,8 +51,14 @@ class Linear_Net(nn.Module):
         # Defines the first convolution:
         self.conv1 = nn.Conv2d(self.input_channel, self.output_channel, self.conv1_filter,
                                padding=self.conv1_padding, stride=self.conv1_stride)
-        self.conv2 = nn.Conv2d(self.output_channel, self.output_channel, self.conv2_filter,
-                               padding=self.conv2_padding, stride=self.conv2_stride)
+        #self.conv2 = nn.Conv2d(self.output_channel, self.output_channel, self.conv2_filter,
+        #                       padding=self.conv2_padding, stride=self.conv2_stride)
+
+        self.convs = nn.ModuleList([nn.Conv2d(self.output_channel, self.output_channel,
+                                              self.conv2_filter, padding=self.conv2_padding,
+                                              stride=self.conv2_stride)
+                                    for i in range(self.nclayers-1)])
+        
         self.fc1 = nn.Linear(self.output_channel*self.act1_map_size*self.act1_map_size, self.num_pCosmol)
                                # act1_map_size is the num pxls on each side of the actv map output from conv layer 1
                                # and we have chosen the padding on conv2 to keep this unchanged,
@@ -63,7 +69,7 @@ class Linear_Net(nn.Module):
         x = F.relu(self.conv1(x))
         # Put the output map through conv2 as many times as nlayers dictates.
         for nl in range(self.nclayers-1):
-            x = F.relu(self.conv2(x))
+            x = F.relu(self.convs[nl](x))
             if nl in self.pool_layers-2:
                 x = self.pool(x)
         x = x.view(-1, x.shape[1]*x.shape[2]*x.shape[3])      # Last 3 numbers are output dims of previous conv.
@@ -104,8 +110,17 @@ class Res_Net(nn.Module):
         # Defines the first convolution:
         self.conv1 = nn.Conv2d(self.input_channel, self.output_channel, self.conv1_filter,
                                padding=self.conv1_padding, stride=self.conv1_stride)
-        self.conv2 = nn.Conv2d(self.output_channel, self.output_channel, self.conv2_filter,
-                               padding=self.conv2_padding, stride=self.conv2_stride)
+        # 1st set of convolutions in the residual block
+        self.convs = nn.ModuleList([nn.Conv2d(self.output_channel, self.output_channel,
+                                              self.conv2_filter, padding=self.conv2_padding,
+                                              stride=self.conv2_stride)
+                                    for i in range(self.nclayers-1)])
+        # 2nd set of convolutions in the residual block
+        self.convs2 = nn.ModuleList([nn.Conv2d(self.output_channel, self.output_channel,
+                                              self.conv2_filter, padding=self.conv2_padding,
+                                              stride=self.conv2_stride)
+                                    for i in range(self.nclayers-1)])
+
         self.fc1 = nn.Linear(self.output_channel*self.act1_map_size*self.act1_map_size, self.num_pCosmol)
         
 
@@ -114,12 +129,12 @@ class Res_Net(nn.Module):
         x = F.relu(self.conv1(x))
         # Put the output map through residual block as many times as nlayers dictates.
         for nl in range(self.nclayers-1):
-            y = self.conv2( F.relu(self.conv2(x)) ) # apply residual block 
-            x = F.relu( x+y )                       # add output to input & act
+            y = self.convs2[nl]( F.relu(self.convs[nl](x)) ) # apply residual block
+            x = F.relu( x+y )                               # add output to input & act
             
-            if nl in self.pool_layers-2:            # apply pooling after specified res-blocks.
+            if nl in self.pool_layers-2:                    # apply pooling after specified res-blocks.
                 x = self.pool(x)
-        x = x.view(-1, x.shape[1]*x.shape[2]*x.shape[3])      # Last 3 numbers are output dims of previous conv.
+        x = x.view(-1, x.shape[1]*x.shape[2]*x.shape[3])    # Last 3 numbers are output dims of previous conv.
         x = self.fc1(x)
         return x
 
